@@ -1894,7 +1894,7 @@ class OrganizerUI:
         max_len = 13 if mode == "compact" else 34
         display_name = Path(item["name"]).stem if item["kind"] != "folder" else item["name"]
         label = display_name if len(display_name) <= max_len else display_name[:max_len-1] + "…"
-        text = label + ("  · 手动" if item["manual"] else "")
+        text = label
         widget = tk.Label(row, text=text, fg=fg, bg=row_bg, anchor="w", font=("Microsoft YaHei UI", int(self.model.store.data["ui"]["font_size"])))
         widget.pack(side="left", fill="x", expand=True, pady=4)
         self.item_widgets.setdefault(cat.id, []).append((item["name"], row))

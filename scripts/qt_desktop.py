@@ -207,7 +207,7 @@ class ItemWidget(QWidget):
             icon_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
             layout.addWidget(icon_label)
             name = Path(item["name"]).stem if item["kind"] != "folder" else item["name"]
-            text = QLabel(name + ("  · 手动" if item.get("manual") else ""), self)
+            text = QLabel(name, self)
             text.setStyleSheet("color: #ffffff; background: transparent;")
             text.setFont(QFont("Microsoft YaHei UI", panel.controller.font_size()))
             text.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -679,6 +679,8 @@ class QtOrganizerUI:
         tags = cached.get("tags", [])
         if tags:
             details.append("标签：" + " · ".join(tags))
+        if item.get("manual"):
+            details.append("已固定归类，自动整理不会移动")
         if details:
             return "\n".join(details)
         if item["kind"] == "folder":
