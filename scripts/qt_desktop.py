@@ -615,15 +615,61 @@ class QtOrganizerUI:
     def icon_for(self, path: str, size: int) -> QIcon:
         key = (path, size)
         if key not in self.icon_cache:
-            icon = self.icon_provider.icon(QFileInfo(path))
+            icon = self.shell_icon(path)
             if icon.isNull():
-                icon = self.style_icon_for_suffix(Path(path).suffix.lower())
+                icon = self.app.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
             self.icon_cache[key] = icon
         return self.icon_cache[key]
 
-    def style_icon_for_suffix(self, suffix: str) -> QIcon:
-        del suffix
-        return self.app.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+    def shell_icon(self, path: str) -> QIcon:
+        """Resolve the visible icon for any desktop entry.
+
+        .url Internet shortcuts carry their icon in the file itself
+        (IconFile/IconIndex) and Qt's QFileIconProvider does not read them,
+        which used to render every game URL as a blank white document icon.
+        """
+        suffix = Path(path).suffix.lower()
+        if suffix == ".url":
+            source, index = self.url_icon_source(path)
+            if source:
+                icon = self.icon_from_source(source, index)
+                if not icon.isNull():
+                    return icon
+        return self.icon_provider.icon(QFileInfo(path))
+
+    def icon_from_source(self, source: str, index: int) -> QIcon:
+        source = os.path.expandvars(source.strip().strip('"'))
+        direct = Path(source)
+        if direct.suffix.lower() in {".ico", ".png", ".jpg", ".jpeg", ".bmp"}:
+            icon = QIcon(str(direct))
+            if not icon.isNull():
+                return icon
+        # Executables/DLLs: let the shell hand out the icon at the stored
+        # index; QFileInfo-based lookup is index-agnostic but still better
+        # than the blank document glyph.
+        return self.icon_provider.icon(QFileInfo(source))
+
+    @staticmethod
+    def url_icon_source(path: str) -> tuple[str | None, int]:
+        try:
+            lines = Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            return None, 0
+        icon_file: str | None = None
+        icon_index = 0
+        for line in lines:
+            key, sep, value = line.partition("=")
+            if not sep:
+                continue
+            key = key.strip().lower()
+            if key == "iconfile" and not icon_file:
+                icon_file = value.strip().strip('"') or None
+            elif key == "iconindex":
+                try:
+                    icon_index = int(value.strip())
+                except ValueError:
+                    pass
+        return icon_file, icon_index
 
     def item_tip(self, item: dict[str, Any]) -> str:
         key = item["name"].lower()
