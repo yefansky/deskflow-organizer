@@ -1,0 +1,6 @@
+fastapi==0.111.0
+Pillow==10.4.0
+pystray==0.19.5
+pywin32==311
+PySide6==6.11.1
+uvicorn==0.41.0

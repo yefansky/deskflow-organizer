@@ -1,0 +1,67 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test-and-package:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Compile Python sources
+        run: python -m compileall -q scripts
+
+      - name: Run unit tests
+        working-directory: scripts
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m unittest discover -p "test_*.py" -v
+
+      - name: Build Windows package
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP "DESKFLOW-windows-x64"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item -Recurse -Force assets, scripts, README.md, requirements.txt, install.ps1, uninstall.ps1, 安装DESKFLOW.bat, 卸载DESKFLOW.bat, 启动DESKFLOW.bat $stage
+          Get-ChildItem -Path $stage -Directory -Filter __pycache__ -Recurse | Remove-Item -Recurse -Force
+          $archive = Join-Path $env:GITHUB_WORKSPACE "DESKFLOW-windows-x64.zip"
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $archive -CompressionLevel Optimal
+          (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant() + "  DESKFLOW-windows-x64.zip" | Set-Content "DESKFLOW-windows-x64.zip.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deskflow-windows
+          path: |
+            DESKFLOW-windows-x64.zip
+            DESKFLOW-windows-x64.zip.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            DESKFLOW-windows-x64.zip
+            DESKFLOW-windows-x64.zip.sha256
