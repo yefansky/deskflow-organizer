@@ -343,7 +343,12 @@ class OrganizerModel:
         present_keys: set[str] = set()
         for root, item in entries:
             if item.name.lower() in {"desktop.ini", "desktop (1).ini"}: continue
-            stat = item.stat()
+            try:
+                stat = item.stat()
+            except OSError:
+                # Antivirus bait/junctions and vanishing entries must not take
+                # the whole organizer down; treat them as invisible.
+                continue
             key = item.name.lower()
             present_keys.add(key)
             # Treat a first scan as familiar, except items changed in the last 7 days.
