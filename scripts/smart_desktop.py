@@ -550,6 +550,70 @@ class OrganizerModel:
         self.store.data.setdefault("pending_inbox", {}).pop(key, None)
         self.store.save()
 
+    def rename_item(self, path_text: str, new_label: str) -> dict[str, str]:
+        """Rename one desktop item and migrate all filename-keyed presentation data."""
+        path = Path(path_text)
+        if not path.exists():
+            raise ValueError("文件已不存在，请刷新桌面后重试")
+        try:
+            parent = path.parent.resolve()
+            roots = {root.resolve() for root in self.desktop_roots}
+        except OSError as exc:
+            raise ValueError(f"无法确认文件位置：{exc}") from exc
+        if parent not in roots:
+            raise ValueError("只能重命名桌面根目录中的文件或文件夹")
+
+        label = str(new_label).strip().rstrip(". ")
+        suffix = "" if path.is_dir() else path.suffix
+        if suffix and label.casefold().endswith(suffix.casefold()):
+            label = label[:-len(suffix)].rstrip()
+        if not label:
+            raise ValueError("名称不能为空")
+        if any(ord(character) < 32 or character in '<>:"/\\|?*' for character in label):
+            raise ValueError('名称不能包含 < > : " / \\ | ? * 等字符')
+        if len(label + suffix) > 255:
+            raise ValueError("名称过长")
+        reserved = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+        if label.split(".", 1)[0].upper() in reserved:
+            raise ValueError("该名称是 Windows 保留名称")
+
+        target = path.with_name(label + suffix)
+        if target.name == path.name:
+            return {"old_name": path.name, "new_name": path.name, "path": str(path)}
+        if target.exists() and target.name.casefold() != path.name.casefold():
+            raise ValueError(f"桌面上已存在“{target.name}”")
+        temporary: Path | None = None
+        try:
+            if target.name.casefold() == path.name.casefold():
+                temporary = path.with_name(f".deskflow-rename-{time.time_ns()}{suffix}")
+                path.rename(temporary)
+                temporary.rename(target)
+            else:
+                path.rename(target)
+        except OSError as exc:
+            if temporary and temporary.exists() and not path.exists():
+                try: temporary.rename(path)
+                except OSError: pass
+            raise ValueError(f"Windows 无法重命名该项：{exc}") from exc
+
+        old_key, new_key = path.name.lower(), target.name.lower()
+        data = self.store.data
+        for field in (
+            "overrides", "pending_inbox", "seen", "visual_assets", "markdown_summaries",
+            "document_summaries", "folder_summaries", "tip_summaries", "item_metadata",
+        ):
+            mapping = data.get(field, {})
+            if isinstance(mapping, dict) and old_key in mapping:
+                mapping[new_key] = mapping.pop(old_key)
+        pending = data.get("pending_inbox", {}).get(new_key)
+        if isinstance(pending, dict) and "path" in pending:
+            pending["path"] = str(target)
+        for names in data.get("item_orders", {}).values():
+            if isinstance(names, list):
+                names[:] = [new_key if name.lower() == old_key else name for name in names]
+        self.store.save()
+        return {"old_name": path.name, "new_name": target.name, "path": str(target)}
+
     def promote_new(self, name: str) -> None:
         self.store.data["seen"].setdefault(name.lower(), {})["first_seen_epoch"] = time.time()
         self.store.save()
@@ -2171,11 +2235,23 @@ class OrganizerUI:
         try: subprocess.Popen(["explorer.exe", "/select,", str(Path(path))])
         except OSError as exc: messagebox.showerror("无法定位", str(exc), parent=self.root)
 
+    def rename_item(self, item: dict[str, Any]) -> None:
+        path = Path(item["path"])
+        current = path.name if item["kind"] == "folder" else path.stem
+        suffix_note = "" if item["kind"] == "folder" or not path.suffix else f"（扩展名 {path.suffix} 会保留）"
+        value = simpledialog.askstring("重命名", f"请输入新名称{suffix_note}：", initialvalue=current, parent=self.root)
+        if value is None: return
+        try: self.model.rename_item(item["path"], value)
+        except ValueError as exc:
+            messagebox.showerror("无法重命名", str(exc), parent=self.root); return
+        self.render()
+
     def assign_menu(self, event: tk.Event, item: dict[str, Any], before: str, container: tk.Widget) -> None:
         self.select_item(before, item["name"], container)
         menu = tk.Menu(self.root, tearoff=False, bg="#1d2a3e", fg="#f4f8ff")
         menu.add_command(label="打开（也可双击）", command=lambda: self.open_item(item["path"]))
         menu.add_command(label="打开所在位置", command=lambda: self.open_location(item["path"]))
+        menu.add_command(label="重命名文件夹" if item["kind"] == "folder" else "重命名文件", command=lambda: self.rename_item(item))
         menu.add_separator()
         menu.add_command(label="放回原生桌面，等待整理", command=lambda: self.assign_item(item["name"], before, "inbox"))
         for cat in all_categories(self.model.store):

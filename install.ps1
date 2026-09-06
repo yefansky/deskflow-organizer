@@ -55,6 +55,7 @@ New-Item -ItemType Directory -Path (Join-Path $InstallRoot "assets") -Force | Ou
 Copy-Item -Path (Join-Path $sourceRoot "scripts\*.py") -Destination (Join-Path $InstallRoot "scripts") -Force
 Copy-Item -Path (Join-Path $sourceRoot "assets\*") -Destination (Join-Path $InstallRoot "assets") -Force
 Copy-Item -LiteralPath (Join-Path $sourceRoot "requirements.txt") -Destination $InstallRoot -Force
+Copy-Item -LiteralPath (Join-Path $sourceRoot "VERSION") -Destination $InstallRoot -Force
 Copy-Item -LiteralPath (Join-Path $sourceRoot "uninstall.ps1") -Destination $InstallRoot -Force
 
 if (-not (Test-Path -LiteralPath $venvPython)) {

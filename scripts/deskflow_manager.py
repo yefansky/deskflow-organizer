@@ -1,7 +1,7 @@
 """Human-friendly lifecycle manager for the local DESKFLOW organizer."""
 from __future__ import annotations
 import ctypes
-import json, os, subprocess, sys, time, winreg, argparse, queue
+import json, os, subprocess, sys, time, winreg, argparse, queue, threading
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, colorchooser, ttk
@@ -10,6 +10,7 @@ import pystray
 from PIL import Image, ImageDraw, ImageTk
 from win32com.client import Dispatch
 import win32api
+from release_updater import current_version, download_and_verify, is_newer_version, latest_release, spawn_update
 
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "DeskflowOrganizer"
@@ -63,7 +64,8 @@ class Manager:
         self.root.bind_all("<MouseWheel>", lambda event: self.canvas.yview_scroll(-1 * (event.delta // 120), "units"), add="+")
         self.canvas.pack(side="left",fill="both",expand=True)
         self.scrollbar.pack(side="right",fill="y")
-        self.status=tk.StringVar(); self.tray_icon=None; self.tray_actions=queue.Queue(); self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
+        self.status=tk.StringVar(); self.update_status=tk.StringVar(value=f"当前版本 {current_version()}")
+        self.update_busy=False; self.tray_icon=None; self.tray_actions=queue.Queue(); self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
         self.draw(); self.refresh()
         # The manager is a tray resident utility.  Its window is only shown
         # when the user explicitly chooses “打开 DESKFLOW 管理器” from the tray.
@@ -113,7 +115,7 @@ class Manager:
         if self.brand_icon: tk.Label(header,image=self.brand_icon,bg=bg).pack(side="left",padx=(0,12))
         heading=tk.Frame(header,bg=bg); heading.pack(side="left")
         tk.Label(heading,text="DESKFLOW",font=("Segoe UI",24,"bold"),fg=accent,bg=bg).pack(anchor="w")
-        tk.Label(heading,text="桌面整理 · 人工调整 · AI 协作",font=("Microsoft YaHei UI",10),fg="#9eb1c9",bg=bg).pack(anchor="w")
+        tk.Label(heading,text=f"桌面整理 · AI 协作 · v{current_version()}",font=("Microsoft YaHei UI",10),fg="#9eb1c9",bg=bg).pack(anchor="w")
         box=tk.Frame(body,bg="#17243a",highlightbackground="#2c4a70",highlightthickness=1); box.pack(fill="x",padx=28,pady=12)
         tk.Label(box,text="运行概览",anchor="w",font=("Microsoft YaHei UI",9,"bold"),fg="#82dff0",bg="#17243a").pack(fill="x",padx=16,pady=(10,0))
         tk.Label(box,textvariable=self.status,justify="left",anchor="w",font=("Microsoft YaHei UI",11),fg=fg,bg="#17243a").pack(fill="x",padx=16,pady=(3,11))
@@ -144,6 +146,9 @@ class Manager:
         tk.Checkbutton(lower,text="登录后自动启用",variable=self.auto,command=self.set_autostart,fg=fg,bg=bg,selectcolor="#19263a",activebackground=bg,activeforeground=fg).pack(side="left")
         self.tray=tk.BooleanVar(value=self.data.get("minimize_to_tray",True)); tk.Checkbutton(lower,text="关闭时收进托盘",variable=self.tray,command=self.set_tray,fg=fg,bg=bg,selectcolor="#19263a",activebackground=bg,activeforeground=fg).pack(side="left",padx=16)
         self.action_button(lower,"打开整理器设置",self.open_settings,tone="secondary").pack(side="right")
+        self.update_button=self.action_button(lower,"检查更新",self.check_for_updates,tone="secondary")
+        self.update_button.pack(side="right",padx=(0,8))
+        tk.Label(body,textvariable=self.update_status,fg="#8fdff3",bg=bg).pack(anchor="e",padx=28,pady=(0,3))
         recovery=tk.LabelFrame(body,text="屏幕恢复与排版",fg="#a9dff0",bg=bg,highlightbackground="#314564",highlightthickness=1,padx=10,pady=5,font=("Microsoft YaHei UI",9,"bold"))
         recovery.pack(fill="x",padx=28,pady=(0,4))
         self.monitor_choices = self.monitor_choices_for_manager()
@@ -224,6 +229,40 @@ class Manager:
         self.install.configure(state="disabled" if installed else "normal"); self.enable.configure(state="normal" if installed else "disabled")
         self.stop.configure(state="normal" if live else "disabled"); self.remove.configure(state="normal" if installed else "disabled")
         self.root.after(1500,self.refresh)
+    def check_for_updates(self):
+        if self.update_busy: return
+        self.update_busy=True; self.update_button.configure(state="disabled"); self.update_status.set("正在检查 GitHub Release…")
+        def worker():
+            try: self.tray_actions.put(("update-result", latest_release()))
+            except Exception as exc: self.tray_actions.put(("update-error", str(exc)))
+        threading.Thread(target=worker, name="deskflow-update-check", daemon=True).start()
+    def handle_update_result(self, release):
+        tag=str(release.get("tag_name", ""))
+        try: available=is_newer_version(tag)
+        except Exception as exc:
+            self.handle_update_error(str(exc)); return
+        if not available:
+            self.update_busy=False; self.update_button.configure(state="normal")
+            self.update_status.set(f"当前版本 {current_version()}，已经是最新版")
+            return
+        if not messagebox.askyesno("发现 DESKFLOW 更新",f"当前版本：{current_version()}\n最新版本：{tag}\n\n是否下载、校验并安装更新？",parent=self.root):
+            self.update_busy=False; self.update_button.configure(state="normal"); self.update_status.set(f"发现 {tag}，尚未安装")
+            return
+        self.update_status.set(f"正在下载并校验 {tag}…")
+        def worker():
+            try: self.tray_actions.put(("update-ready", str(download_and_verify(release))))
+            except Exception as exc: self.tray_actions.put(("update-error", str(exc)))
+        threading.Thread(target=worker, name="deskflow-update-download", daemon=True).start()
+    def handle_update_error(self, detail: str):
+        self.update_busy=False; self.update_button.configure(state="normal"); self.update_status.set("更新检查失败")
+        messagebox.showerror("DESKFLOW 更新失败",detail,parent=self.root)
+    def apply_downloaded_update(self, package: str):
+        try:
+            spawn_update(Path(package), os.getpid())
+        except Exception as exc:
+            self.handle_update_error(str(exc)); return
+        self.update_status.set("更新已校验，正在重启安装…")
+        self.exit_desktopflow()
     def install_app(self):
         self.data["installed"]=True; self.register_context_menu(); self.create_desktop_shortcut(); save(self.data); self.refresh()
 
@@ -333,6 +372,14 @@ class Manager:
                 self.apply_monitor_and_arrange(target or "primary", notify_failure=True)
             elif action == "stop":
                 self.stop_app()
+            elif action == "check-update":
+                self.root.deiconify(); self.root.lift(); self.check_for_updates()
+            elif action == "update-result":
+                self.handle_update_result(target)
+            elif action == "update-error":
+                self.handle_update_error(str(target))
+            elif action == "update-ready":
+                self.apply_downloaded_update(str(target)); return
             elif action == "exit":
                 self.exit_desktopflow(); return
         if self.root.winfo_exists(): self.root.after(80, self.process_tray_actions)
@@ -348,6 +395,7 @@ class Manager:
             pystray.MenuItem("当前屏幕弹性重排",self.tray_arrange_current),
             pystray.MenuItem("移动全部到指定屏幕并弹性排版",monitor_menu),
             pystray.MenuItem("暂停并显示原生图标",self.enqueue_tray_action("stop")),
+            pystray.MenuItem("检查 GitHub Release 更新",self.enqueue_tray_action("check-update")),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出 DESKFLOW",self.enqueue_tray_action("exit")),
         )

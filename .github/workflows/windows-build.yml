@@ -37,12 +37,21 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: python -m unittest discover -p "test_*.py" -v
 
+      - name: Verify release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $expected = "v$((Get-Content VERSION -Raw).Trim())"
+          if ($env:GITHUB_REF_NAME -ne $expected) {
+            throw "Tag $env:GITHUB_REF_NAME does not match VERSION $expected"
+          }
+
       - name: Build Windows package
         shell: pwsh
         run: |
           $stage = Join-Path $env:RUNNER_TEMP "DESKFLOW-windows-x64"
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          Copy-Item -Recurse -Force assets, scripts, README.md, requirements.txt, install.ps1, uninstall.ps1, 安装DESKFLOW.bat, 卸载DESKFLOW.bat, 启动DESKFLOW.bat $stage
+          Copy-Item -Recurse -Force assets, scripts, README.md, VERSION, requirements.txt, install.ps1, uninstall.ps1, 安装DESKFLOW.bat, 卸载DESKFLOW.bat, 启动DESKFLOW.bat $stage
           Get-ChildItem -Path $stage -Directory -Filter __pycache__ -Recurse | Remove-Item -Recurse -Force
           $archive = Join-Path $env:GITHUB_WORKSPACE "DESKFLOW-windows-x64.zip"
           Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $archive -CompressionLevel Optimal

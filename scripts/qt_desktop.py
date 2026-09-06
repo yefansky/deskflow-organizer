@@ -1179,6 +1179,7 @@ class QtOrganizerUI:
         menu = QMenu()
         menu.addAction("打开（也可双击）", lambda: self.open_item(item["path"]))
         menu.addAction("打开所在位置", lambda: self.open_location(item["path"]))
+        rename_action = menu.addAction("重命名文件夹" if item["kind"] == "folder" else "重命名文件")
         menu.addSeparator()
         menu.addAction("放回原生桌面，等待整理", lambda: self.move_items_to_category([(item["name"], source)], "inbox"))
         assign = menu.addMenu("归到其他分类")
@@ -1195,10 +1196,27 @@ class QtOrganizerUI:
         menu.addSeparator()
         recycle_action = menu.addAction("移到回收站")
         chosen = menu.exec(point)
-        # Run deletion after QMenu.exec() has unwound so the item is never
+        # Run mutations after QMenu.exec() has unwound so the item is never
         # destroyed inside its mousePressEvent or the menu's nested event loop.
-        if chosen is recycle_action:
+        if chosen is rename_action:
+            self.rename_item(widget)
+        elif chosen is recycle_action:
             self.recycle_item(widget)
+
+    def rename_item(self, widget: ItemWidget) -> None:
+        item = widget.item
+        path = Path(item["path"])
+        current = path.name if item["kind"] == "folder" else path.stem
+        suffix_note = "" if item["kind"] == "folder" or not path.suffix else f"（扩展名 {path.suffix} 会保留）"
+        value, accepted = QInputDialog.getText(None, "重命名", f"请输入新名称{suffix_note}：", text=current)
+        if not accepted:
+            return
+        try:
+            self.model.rename_item(item["path"], value)
+        except ValueError as exc:
+            QMessageBox.critical(None, "无法重命名", str(exc))
+            return
+        self.render()
 
     def reset_item(self, name: str, source: str) -> None:
         self.model.set_category(name, "archive", False)
