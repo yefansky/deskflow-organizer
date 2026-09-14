@@ -5,6 +5,7 @@ to run on a developer desktop. User data retention is checked byte-for-byte.
 """
 import hashlib
 import json
+import base64
 import os
 from pathlib import Path
 import subprocess
@@ -13,6 +14,7 @@ import time
 from urllib.request import urlopen
 from win32com.client import Dispatch
 from win32com.shell import shell, shellcon
+import pythoncom
 
 from verify_bundle import verify
 
@@ -56,8 +58,12 @@ def main():
     desktop = Path(shell.SHGetFolderPath(0, shellcon.CSIDL_DESKTOPDIRECTORY, None, 0))
     link = desktop / 'DESKFLOW 管理器.lnk'
     assert link.is_file(), {'desktop': str(desktop), 'entries': [p.name for p in desktop.iterdir()]}
-    shortcut = Dispatch('WScript.Shell').CreateShortcut(str(link)).TargetPath
-    assert Path(shortcut) == install / 'DESKFLOW.exe', {'link': str(link), 'target': shortcut}
+    (evidence / 'desktop-shortcut.lnk').write_bytes(link.read_bytes())
+    shell_link = pythoncom.CoCreateInstance(shell.CLSID_ShellLink, None, pythoncom.CLSCTX_INPROC_SERVER, shell.IID_IShellLink)
+    shell_link.QueryInterface(pythoncom.IID_IPersistFile).Load(str(link))
+    shell_link.Resolve(0, shell.SLR_NO_UI | shell.SLR_NOSEARCH | shell.SLR_NOTRACK)
+    shortcut = shell_link.GetPath(shell.SLGP_RAWPATH)[0]
+    assert Path(shortcut).resolve() == (install / 'DESKFLOW.exe').resolve(), {'link': str(link), 'target': shortcut, 'lnk_base64': base64.b64encode(link.read_bytes()).decode()}
     # Hold a live stdio MCP process: installer must tell it to exit before
     # replacing the shared Python DLL, rather than leave a partial install.
     mcp = subprocess.Popen([str(install / 'DeskflowMCP.exe')], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
