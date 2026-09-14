@@ -450,10 +450,13 @@ def main():
         raise SystemExit(0)
     try:
         manager=Manager()
+        if FROZEN: print('Manager initialized.', flush=True)
         if args.install or args.start:
             manager.install_app()
+            if FROZEN: print('Manager installation entries registered.', flush=True)
         if args.install or args.start:
             manager.enable_app()
+            if FROZEN: print('Overlay start requested.', flush=True)
         manager.root.mainloop()
     finally:
         kernel32.CloseHandle(instance_mutex)

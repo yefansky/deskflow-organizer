@@ -111,6 +111,11 @@ def main():
         catalog = subprocess.run([str(install / 'DeskflowMCP.exe')], input=catalog_request, capture_output=True, text=True, encoding='utf-8', timeout=20)
         assert catalog.returncode == 0 and 'result' in json.loads(catalog.stdout), catalog.stderr
     finally:
+        runtime_log = Path(os.environ['LOCALAPPDATA']) / 'DeskflowOrganizer/runtime.log'
+        if runtime_log.exists():
+            runtime_text = runtime_log.read_text(encoding='utf-8', errors='replace')
+            (evidence / 'runtime.log').write_text(runtime_text, encoding='utf-8')
+            if not live: print(runtime_text[-8000:], flush=True)
         run(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', root / 'packaging/prepare-install.ps1', '-InstallRoot', install], timeout=60)
         manager.wait(timeout=15)
     before_uninstall = state.read_bytes()
