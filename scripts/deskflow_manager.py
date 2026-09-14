@@ -270,7 +270,15 @@ class Manager:
         self.update_status.set("更新已校验，正在重启安装…")
         self.exit_desktopflow()
     def install_app(self):
-        self.data["installed"]=True; self.register_context_menu(); self.create_desktop_shortcut(); save(self.data); self.refresh()
+        self.data["installed"]=True
+        # Inno owns frozen shortcuts and registry entries (including uninstall).
+        # Rewriting them through WScript during every startup can block on a
+        # modal COM warning before the overlay has even been launched.
+        if not FROZEN:
+            self.register_context_menu()
+            self.create_desktop_shortcut()
+        save(self.data)
+        self.refresh()
 
     def create_desktop_shortcut(self):
         """Create a discoverable desktop entry without exposing a cmd window."""
@@ -285,6 +293,8 @@ class Manager:
             shortcut.Description = "打开 DESKFLOW 智能桌面整理管理器"
             shortcut.Save()
         except Exception as exc:
+            import traceback
+            traceback.print_exc()
             messagebox.showwarning("DESKFLOW", f"已完成安装，但未能创建桌面快捷方式：{exc}", parent=self.root)
 
     def register_context_menu(self):

@@ -2,13 +2,25 @@ import hashlib
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 import app_runtime
 import release_updater as updater
 
 
 class InstallerUpdateTests(unittest.TestCase):
+    def test_frozen_startup_leaves_shell_entries_to_installer(self):
+        import deskflow_manager
+        manager = Mock()
+        manager.data = {}
+        with patch.object(deskflow_manager, 'FROZEN', True), patch.object(deskflow_manager, 'save') as save:
+            deskflow_manager.Manager.install_app(manager)
+        manager.register_context_menu.assert_not_called()
+        manager.create_desktop_shortcut.assert_not_called()
+        self.assertTrue(manager.data['installed'])
+        save.assert_called_once_with(manager.data)
+        manager.refresh.assert_called_once()
+
     def release(self):
         return {'tag_name': 'v0.3.10', 'transport': 'https', 'assets': [
             {'name': name, 'browser_download_url': name} for name in (updater.INSTALLER_NAME, updater.INSTALLER_NAME + '.sha256')]}
