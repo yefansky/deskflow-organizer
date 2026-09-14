@@ -64,6 +64,7 @@ def main():
     shell_link.Resolve(0, shell.SLR_NO_UI | shell.SLR_NOSEARCH | shell.SLR_NOTRACK)
     shortcut = shell_link.GetPath(shell.SLGP_RAWPATH)[0]
     assert Path(shortcut).resolve() == (install / 'DESKFLOW.exe').resolve(), {'link': str(link), 'target': shortcut, 'lnk_base64': base64.b64encode(link.read_bytes()).decode()}
+    shell_link = None
     # Hold a live stdio MCP process: installer must tell it to exit before
     # replacing the shared Python DLL, rather than leave a partial install.
     mcp = subprocess.Popen([str(install / 'DeskflowMCP.exe')], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -107,7 +108,7 @@ def main():
                 time.sleep(.5)
         assert live and manager.poll() is None, 'Installed manager/overlay failed to start.'
         catalog_request = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {'name': 'get_desktop_catalog', 'arguments': {'limit': 1}}}) + '\n'
-        catalog = run_mcp = subprocess.run([str(install / 'DeskflowMCP.exe')], input=catalog_request, capture_output=True, text=True, encoding='utf-8', timeout=20)
+        catalog = subprocess.run([str(install / 'DeskflowMCP.exe')], input=catalog_request, capture_output=True, text=True, encoding='utf-8', timeout=20)
         assert catalog.returncode == 0 and 'result' in json.loads(catalog.stdout), catalog.stderr
     finally:
         run(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', root / 'packaging/prepare-install.ps1', '-InstallRoot', install], timeout=60)
