@@ -10,6 +10,9 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from urllib.request import urlopen
+from win32com.client import Dispatch
+from win32com.shell import shell, shellcon
 
 from verify_bundle import verify
 
@@ -50,9 +53,11 @@ def main():
     state.parent.mkdir(parents=True, exist_ok=True)
     sentinel = b'{"test":"preserve classifications and user preferences"}'
     state.write_bytes(sentinel)
-    shortcut_script = r"$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\DESKFLOW 管理器.lnk'); $s.TargetPath"
-    shortcut = run(['powershell.exe', '-NoProfile', '-Command', shortcut_script]).stdout.strip()
-    assert Path(shortcut) == install / 'DESKFLOW.exe', shortcut
+    desktop = Path(shell.SHGetFolderPath(0, shellcon.CSIDL_DESKTOPDIRECTORY, None, 0))
+    link = desktop / 'DESKFLOW 管理器.lnk'
+    assert link.is_file(), {'desktop': str(desktop), 'entries': [p.name for p in desktop.iterdir()]}
+    shortcut = Dispatch('WScript.Shell').CreateShortcut(str(link)).TargetPath
+    assert Path(shortcut) == install / 'DESKFLOW.exe', {'link': str(link), 'target': shortcut}
     # Hold a live stdio MCP process: installer must tell it to exit before
     # replacing the shared Python DLL, rather than leave a partial install.
     mcp = subprocess.Popen([str(install / 'DeskflowMCP.exe')], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -81,12 +86,33 @@ def main():
     # Old clients still targeting scripts/mcp_server.py must reach the new MCP.
     legacy = subprocess.run([sys.executable, str(install / 'scripts/mcp_server.py')], input='{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n', capture_output=True, text=True, encoding='utf-8', timeout=30)
     assert legacy.returncode == 0 and len(json.loads(legacy.stdout)['result']['tools']) >= 17
+    # Exercise the actual installed manager -> overlay -> HTTP/MCP lifecycle,
+    # not just dependency imports. This runs only on the disposable CI desktop.
+    manager = subprocess.Popen([str(install / 'DESKFLOW.exe'), '--start'])
+    live = False
+    try:
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            try:
+                with urlopen('http://127.0.0.1:8765/health', timeout=1) as response:
+                    live = response.status == 200
+                if live: break
+            except OSError:
+                time.sleep(.5)
+        assert live and manager.poll() is None, 'Installed manager/overlay failed to start.'
+        catalog_request = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {'name': 'get_desktop_catalog', 'arguments': {'limit': 1}}}) + '\n'
+        catalog = run_mcp = subprocess.run([str(install / 'DeskflowMCP.exe')], input=catalog_request, capture_output=True, text=True, encoding='utf-8', timeout=20)
+        assert catalog.returncode == 0 and 'result' in json.loads(catalog.stdout), catalog.stderr
+    finally:
+        run(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', root / 'packaging/prepare-install.ps1', '-InstallRoot', install], timeout=60)
+        manager.wait(timeout=15)
+    before_uninstall = state.read_bytes()
     run([install / 'unins000.exe', '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/LOG=' + str(evidence / 'uninstall.log')])
     assert not (install / 'DESKFLOW.exe').exists()
-    assert state.read_bytes() == sentinel
+    assert state.read_bytes() == before_uninstall
     (evidence / 'installation.json').write_text(json.dumps({'ok': True, 'old_version': old_version, 'new_version': new_version,
         'shortcut': shortcut, 'handoff_seconds': elapsed, 'mcp_lock_released': True, 'legacy_mcp': True,
-        'settings_retained_after_update_and_uninstall': True}, indent=2), encoding='utf-8')
+        'installed_manager_overlay_mcp': live, 'settings_retained_after_update_and_uninstall': True}, indent=2), encoding='utf-8')
     print('Real installer, two-version update, MCP release, legacy MCP and uninstall verified.')
 
 
