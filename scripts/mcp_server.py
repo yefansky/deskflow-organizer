@@ -1,11 +1,12 @@
 """Local stdio MCP bridge for AI-assisted DESKFLOW desktop organization."""
 from __future__ import annotations
-import json, sys, subprocess
+import json, sys, subprocess, os
+from app_runtime import command, watch_update
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-BASE = "http://127.0.0.1:8765"
+BASE = "http://127.0.0.1:" + str(int(os.environ.get("DESKFLOW_API_PORT", "8765")))
 if hasattr(sys.stdin, "reconfigure"):
     sys.stdin.reconfigure(encoding="utf-8")
 if hasattr(sys.stdout, "reconfigure"):
@@ -31,7 +32,7 @@ TOOLS = [
 ]
 MANAGER = Path(__file__).with_name("deskflow_manager.py")
 def launch_manager(install=False):
-    subprocess.Popen([sys.executable, str(MANAGER), *( ["--install"] if install else [])], creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
+    subprocess.Popen(command("manager", "--install" if install else "--start"), creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
     return {"ok":True,"message":"DESKFLOW 管理器已打开。"}
 def request(path, payload=None):
     try:
@@ -42,14 +43,16 @@ def request(path, payload=None):
         try: detail = json.loads(exc.read()).get("detail", str(exc))
         except Exception: detail = str(exc)
         raise RuntimeError(f"DESKFLOW 请求无效：{detail}") from exc
-    except URLError as exc: raise RuntimeError("桌面整理器未运行：请先启动 smart_desktop.py。") from exc
+    except URLError as exc: raise RuntimeError("桌面整理器未运行：请调用 open_desktop_manager 或启动 DESKFLOW。") from exc
 def reply(id, result=None, error=None):
     body={"jsonrpc":"2.0","id":id}
     if error: body["error"]={"code":-32000,"message":error}
     else: body["result"]=result
     print(json.dumps(body,ensure_ascii=False),flush=True)
+watch_update(lambda: os._exit(0))
 for line in sys.stdin:
     try:
+        msg = {}
         msg=json.loads(line); method=msg.get("method"); ident=msg.get("id")
         if method=="initialize": reply(ident,{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"smart-desktop-organizer","version":"0.3.0"},"instructions":"桌面整理优先使用 get_desktop_catalog，再按需 inspect_desktop_items，最后用一次 organize_desktop_items 批量提交并复核；不要覆盖 manual=true 的人工习惯，除非用户明确要求。"})
         elif method=="tools/list": reply(ident,{"tools":TOOLS})
@@ -60,5 +63,6 @@ for line in sys.stdin:
                 mapping={"get_desktop_catalog":("/catalog",args),"inspect_desktop_items":("/inspect-items",args),"organize_desktop_items":("/organize-batch",args),"manage_desktop_categories":("/categories",args),"desktop_layout":("/layout",None),"rescan_desktop":("/rescan",{}),"assign_desktop_item":("/assign",args),"update_desktop_ui":("/settings",args),"update_desktop_panel_style":("/panel-style",args),"set_desktop_panel_mode":("/panel-mode",args),"set_desktop_sorting":("/set-sorting",args),"reorder_desktop_item":("/reorder-item",args),"show_native_desktop":("/show-native-icons",{}),"arrange_desktop_top_right":("/arrange-top-right",{}),"move_desktop_panel":("/move-panel",args)}
                 path,payload=mapping[name]; value=request(path,payload)
             reply(ident,{"content":[{"type":"text","text":json.dumps(value,ensure_ascii=False,indent=2)}]})
-        elif ident is not None: reply(ident,{})
+        elif method == "ping": reply(ident,{})
+        elif ident is not None: reply(ident,error="不支持的方法：" + str(method))
     except Exception as exc: reply(msg.get("id") if 'msg' in locals() else None,error=str(exc))

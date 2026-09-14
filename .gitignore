@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 dist/
 build/
+.codegraph/
 *.log
 
 # Local visual-regression captures are evidence, not release inputs.

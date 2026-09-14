@@ -48,6 +48,10 @@ def main() -> None:
     args = parser.parse_args()
     kernel32 = ctypes.windll.kernel32
     synchronize = 0x00100000
+    kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_bool, ctypes.c_ulong]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     handle = kernel32.OpenProcess(synchronize, False, args.parent)
     if handle:
         kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)

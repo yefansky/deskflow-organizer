@@ -11,12 +11,13 @@ from PIL import Image, ImageDraw, ImageTk
 from win32com.client import Dispatch
 import win32api
 from release_updater import current_version, download_and_verify, is_newer_version, latest_release, spawn_update
+from app_runtime import APP_ROOT, RESOURCE_ROOT, FROZEN, command, watch_update
 
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "DeskflowOrganizer"
 STATE = STATE_DIR / "manager.json"
 STARTUP = Path(os.environ.get("APPDATA", Path.home())) / "Microsoft/Windows/Start Menu/Programs/Startup/DESKFLOW 启动器.bat"
-ASSET_DIR = ROOT.parent / "assets"
+ASSET_DIR = RESOURCE_ROOT / "assets"
 ICON_PNG = ASSET_DIR / "deskflow-icon-v1.png"
 ICON_ICO = ASSET_DIR / "deskflow-icon-v1.ico"
 
@@ -73,6 +74,9 @@ class Manager:
         self.root.after(80, self.process_tray_actions)
         self.root.after_idle(self.fit_to_work_area)
         self.root.after_idle(self.root.withdraw)
+        self.update_silent = False
+        watch_update(lambda: self.tray_actions.put(("exit", None)))
+        self.root.after(12000, lambda: self.check_for_updates(silent=True))
     @staticmethod
     def load_brand_icon(size: int):
         try:
@@ -229,8 +233,9 @@ class Manager:
         self.install.configure(state="disabled" if installed else "normal"); self.enable.configure(state="normal" if installed else "disabled")
         self.stop.configure(state="normal" if live else "disabled"); self.remove.configure(state="normal" if installed else "disabled")
         self.root.after(1500,self.refresh)
-    def check_for_updates(self):
+    def check_for_updates(self, silent=False):
         if self.update_busy: return
+        self.update_silent = silent
         self.update_busy=True; self.update_button.configure(state="disabled"); self.update_status.set("正在检查 GitHub Release…")
         def worker():
             try: self.tray_actions.put(("update-result", latest_release()))
@@ -255,7 +260,8 @@ class Manager:
         threading.Thread(target=worker, name="deskflow-update-download", daemon=True).start()
     def handle_update_error(self, detail: str):
         self.update_busy=False; self.update_button.configure(state="normal"); self.update_status.set("更新检查失败")
-        messagebox.showerror("DESKFLOW 更新失败",detail,parent=self.root)
+        if not getattr(self, "update_silent", False):
+            messagebox.showerror("DESKFLOW 更新失败",detail,parent=self.root)
     def apply_downloaded_update(self, package: str):
         try:
             spawn_update(Path(package), os.getpid())
@@ -271,9 +277,10 @@ class Manager:
         try:
             DESKTOP_SHORTCUT.parent.mkdir(parents=True, exist_ok=True)
             shortcut = Dispatch("WScript.Shell").CreateShortcut(str(DESKTOP_SHORTCUT))
-            shortcut.TargetPath = gui_python()
-            shortcut.Arguments = f'"{ROOT / "deskflow_manager.py"}"'
-            shortcut.WorkingDirectory = str(ROOT)
+            launch = command("manager", "--start")
+            shortcut.TargetPath = launch[0]
+            shortcut.Arguments = subprocess.list2cmdline(launch[1:])
+            shortcut.WorkingDirectory = str(APP_ROOT)
             shortcut.IconLocation = f"{ICON_ICO},0" if ICON_ICO.exists() else f"{gui_python()},0"
             shortcut.Description = "打开 DESKFLOW 智能桌面整理管理器"
             shortcut.Save()
@@ -286,7 +293,8 @@ class Manager:
             winreg.SetValueEx(menu, None, 0, winreg.REG_SZ, "DESKFLOW 图标整理管理器")
             winreg.SetValueEx(menu, "Icon", 0, winreg.REG_SZ, str(ICON_ICO if ICON_ICO.exists() else Path(sys.executable)))
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key + r"\command") as command:
-            winreg.SetValueEx(command, None, 0, winreg.REG_SZ, f'"{gui_python()}" "{ROOT / "deskflow_manager.py"}"')
+            from app_runtime import command as launch_command
+            winreg.SetValueEx(command, None, 0, winreg.REG_SZ, subprocess.list2cmdline(launch_command("manager", "--start")))
 
     def remove_context_menu(self):
         key = r"Software\Classes\DesktopBackground\Shell\DESKFLOW"
@@ -296,7 +304,7 @@ class Manager:
     def enable_app(self):
         if not self.data.get("installed"): self.install_app()
         if not self.online():
-            proc=subprocess.Popen([gui_python(),str(ROOT/"smart_desktop.py")],cwd=ROOT)
+            proc=subprocess.Popen(command("overlay"),cwd=APP_ROOT,creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
             self.data["pid"]=proc.pid; save(self.data)
         self.refresh()
     def open_settings(self):
@@ -334,7 +342,7 @@ class Manager:
     def write_autostart_entry():
         """Login must enter through the manager so the tray is always alive."""
         STARTUP.parent.mkdir(parents=True,exist_ok=True)
-        STARTUP.write_text(f'@echo off\r\nstart "" "{gui_python()}" "{ROOT / "deskflow_manager.py"}" --start\r\n',encoding="utf-8")
+        STARTUP.write_text('@echo off\r\nstart "" ' + subprocess.list2cmdline(command("manager", "--start")) + '\r\n',encoding="utf-8")
     def set_tray(self):
         self.data["minimize_to_tray"]=bool(self.tray.get()); save(self.data)
     @staticmethod
@@ -414,6 +422,10 @@ class Manager:
         if self.tray_icon: self.tray_icon.stop(); self.tray_icon=None
         self.root.destroy()
     def uninstall(self):
+        if FROZEN:
+            subprocess.Popen([str(APP_ROOT / "unins000.exe")])
+            self.exit_desktopflow()
+            return
         if not messagebox.askyesno("确认卸载","将关闭整理器并删除它的本机配置和自动启动入口；不会删除桌面文件。是否继续？",parent=self.root): return
         self.stop_app()
         if STARTUP.exists(): STARTUP.unlink()
@@ -421,13 +433,15 @@ class Manager:
         self.remove_context_menu()
         if STATE.exists(): STATE.unlink()
         self.data={"installed":False,"pid":None,"autostart":False}; save(self.data); self.auto.set(False); self.refresh()
-if __name__ == "__main__":
+def main():
     parser=argparse.ArgumentParser(add_help=False)
     parser.add_argument("--install",action="store_true")
     parser.add_argument("--start",action="store_true",help="start the manager and desktop blocks")
     args,_unknown=parser.parse_known_args()
     kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
     kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel32.SetLastError(0)
     instance_mutex = kernel32.CreateMutexW(None, False, "Local\\DeskflowOrganizer.Manager")
     if not instance_mutex or kernel32.GetLastError() == 183:
@@ -443,3 +457,6 @@ if __name__ == "__main__":
         manager.root.mainloop()
     finally:
         kernel32.CloseHandle(instance_mutex)
+
+if __name__ == "__main__":
+    main()

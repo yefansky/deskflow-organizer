@@ -40,6 +40,7 @@ import win32gui
 import win32ui
 from win32com.client import Dispatch
 from layout_engine import Rect, overlaps, pack_rectangles, resize_rectangle
+from app_runtime import command, APP_ROOT
 try:
     import winreg
 except ImportError:
@@ -1245,7 +1246,7 @@ class DesktopShell:
         guard_script = Path(__file__).with_name("native_icon_guard.py")
         try:
             self.guard = subprocess.Popen(
-                [sys.executable, str(guard_script), "--parent", str(os.getpid()), "--state", str(NATIVE_ICON_STATE_PATH)],
+                command("guard", "--parent", os.getpid(), "--state", NATIVE_ICON_STATE_PATH),
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except OSError:
@@ -2830,7 +2831,7 @@ def main() -> None:
         else:
             manager_script = Path(__file__).with_name("deskflow_manager.py")
             gui_executable = Path(sys.executable).with_name("pythonw.exe")
-            subprocess.Popen([str(gui_executable if gui_executable.exists() else sys.executable), str(manager_script), "--start"], cwd=manager_script.parent)
+            subprocess.Popen(command("manager", "--start"), cwd=APP_ROOT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             return
     # The BAT may be double-clicked repeatedly.  Only the visible overlay owns
     # this mutex; headless inspection/service commands remain independently
