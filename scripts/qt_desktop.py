@@ -237,6 +237,7 @@ class ItemWidget(QWidget):
         super().paintEvent(event)
 
     def enterEvent(self, event) -> None:  # type: ignore[override]
+        self.panel.unsetCursor()
         self.hovered = True
         self.update()
         self.panel.schedule_item_tip(self)
@@ -531,6 +532,10 @@ class PanelWindow(QWidget):
         }
         self.setCursor(cursors.get(edges, Qt.CursorShape.ArrowCursor))
         super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:  # type: ignore[override]
+        self.unsetCursor()
+        super().leaveEvent(event)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1176,6 +1181,27 @@ class QtOrganizerUI:
 
     def show_item_menu(self, widget: ItemWidget, point: QPoint) -> None:
         item, source = widget.item, widget.panel.category.id
+        from native_context_menu import show_file_menu
+        actions = [
+            ("打开所在位置", lambda: self.open_location(item["path"])),
+            ("放回原生桌面，等待整理", lambda: self.move_items_to_category([(item["name"], source)], "inbox")),
+        ]
+        for category in self.categories():
+            if category.id not in ("inbox", source):
+                actions.append((f"归到 {category.title}", lambda target=category.id: self.move_items_to_category([(item["name"], source)], target)))
+        actions.extend([
+            ("取消手动归类，让 AI 按规则判断", lambda: self.reset_item(item["name"], source)),
+            ("重命名（保留整理记录）", lambda: self.rename_item(widget)),
+            ("移到回收站", lambda: self.recycle_item(widget)),
+        ])
+        try:
+            callback = show_file_menu(item["path"], point.x(), point.y(), actions, lambda: self.rename_item(widget))
+        except Exception as exc:
+            QMessageBox.warning(None, "系统右键菜单无法加载", f"{exc}\n将显示备用菜单；可通过‘打开所在位置’使用资源管理器菜单。")
+        else:
+            if callback:
+                QTimer.singleShot(0, callback)
+            return
         menu = QMenu()
         menu.addAction("打开（也可双击）", lambda: self.open_item(item["path"]))
         menu.addAction("打开所在位置", lambda: self.open_location(item["path"]))

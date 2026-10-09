@@ -2249,6 +2249,27 @@ class OrganizerUI:
 
     def assign_menu(self, event: tk.Event, item: dict[str, Any], before: str, container: tk.Widget) -> None:
         self.select_item(before, item["name"], container)
+        from native_context_menu import show_file_menu
+        actions = [
+            ("打开所在位置", lambda: self.open_location(item["path"])),
+            ("放回原生桌面，等待整理", lambda: self.assign_item(item["name"], before, "inbox")),
+        ]
+        for cat in all_categories(self.model.store):
+            if cat.id not in ("inbox", before):
+                actions.append((f"归到 {cat.title}", lambda target=cat.id: self.assign_item(item["name"], before, target)))
+        actions.extend([
+            ("取消手动归类，让 AI 按规则判断", lambda: self.reset_item_classification(item["name"], before)),
+            ("重命名（保留整理记录）", lambda: self.rename_item(item)),
+            ("移到回收站", lambda: self.recycle_item(item, before)),
+        ])
+        try:
+            callback = show_file_menu(item["path"], event.x_root, event.y_root, actions, lambda: self.rename_item(item))
+        except Exception as exc:
+            messagebox.showwarning("系统右键菜单无法加载", f"{exc}\n将显示备用菜单；可通过‘打开所在位置’使用资源管理器菜单。", parent=self.root)
+        else:
+            if callback:
+                self.root.after_idle(callback)
+            return
         menu = tk.Menu(self.root, tearoff=False, bg="#1d2a3e", fg="#f4f8ff")
         menu.add_command(label="打开（也可双击）", command=lambda: self.open_item(item["path"]))
         menu.add_command(label="打开所在位置", command=lambda: self.open_location(item["path"]))
