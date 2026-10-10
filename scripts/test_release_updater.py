@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import tempfile
+import subprocess
 import unittest
 import zipfile
 from pathlib import Path
@@ -11,6 +12,50 @@ import release_updater
 
 
 class ReleaseUpdaterTests(unittest.TestCase):
+    def test_valid_cli_login_does_not_read_git_credentials(self):
+        result = subprocess.CompletedProcess([], 0, '{}', '')
+        with patch.object(release_updater, '_github_cli', return_value='gh.exe'), \
+             patch.object(release_updater.subprocess, 'run', return_value=result), \
+             patch.object(release_updater, '_git_github_token') as credentials:
+            self.assertIs(release_updater._run_gh(['api', 'repos/example']), result)
+        credentials.assert_not_called()
+
+    def test_invalid_cli_login_retries_with_private_child_environment(self):
+        failed = subprocess.CompletedProcess([], 1, '', 'invalid login')
+        success = subprocess.CompletedProcess([], 0, '{}', '')
+        with patch.object(release_updater, '_github_cli', return_value='gh.exe'), \
+             patch.object(release_updater.subprocess, 'run', side_effect=[failed, success]) as run, \
+             patch.object(release_updater, '_git_github_token', return_value='fixture-secret'):
+            release = release_updater.latest_release()
+        self.assertEqual(release['transport'], 'gh')
+        self.assertEqual(run.call_args.kwargs['env']['GH_TOKEN'], 'fixture-secret')
+        self.assertNotIn('fixture-secret', str(run.call_args.args))
+        self.assertNotIn('fixture-secret', str(release))
+
+    def test_failed_retry_redacts_credential_in_error(self):
+        failed = subprocess.CompletedProcess([], 1, '', 'invalid login')
+        echoed = subprocess.CompletedProcess([], 1, '', 'fixture-secret denied')
+        with patch.object(release_updater, '_github_cli', return_value='gh.exe'), \
+             patch.object(release_updater.subprocess, 'run', side_effect=[failed, echoed]), \
+             patch.object(release_updater, '_git_github_token', return_value='fixture-secret'):
+            with self.assertRaises(release_updater.UpdateError) as error:
+                release_updater._run_gh(['api', 'repos/example'])
+        self.assertNotIn('fixture-secret', str(error.exception))
+
+    def test_git_credential_lookup_cannot_prompt(self):
+        result = subprocess.CompletedProcess([], 0, 'username=test\npassword=fixture-secret\n', '')
+        with patch.object(release_updater.shutil, 'which', return_value='git.exe'), \
+             patch.object(release_updater.subprocess, 'run', return_value=result) as run:
+            self.assertEqual(release_updater._git_github_token(), 'fixture-secret')
+        environment = run.call_args.kwargs['env']
+        self.assertEqual(environment['GIT_TERMINAL_PROMPT'], '0')
+        self.assertEqual(environment['GCM_INTERACTIVE'], 'never')
+
+    def test_git_credential_timeout_is_optional(self):
+        with patch.object(release_updater.shutil, 'which', return_value='git.exe'), \
+             patch.object(release_updater.subprocess, 'run', side_effect=subprocess.TimeoutExpired('git', 15)):
+            self.assertIsNone(release_updater._git_github_token())
+
     def test_semantic_versions_only_move_forward(self) -> None:
         self.assertTrue(release_updater.is_newer_version("v0.2.0", "0.1.1"))
         self.assertFalse(release_updater.is_newer_version("v0.1.1", "0.1.1"))

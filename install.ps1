@@ -57,6 +57,8 @@ Copy-Item -Path (Join-Path $sourceRoot "assets\*") -Destination (Join-Path $Inst
 Copy-Item -LiteralPath (Join-Path $sourceRoot "requirements.txt") -Destination $InstallRoot -Force
 Copy-Item -LiteralPath (Join-Path $sourceRoot "VERSION") -Destination $InstallRoot -Force
 Copy-Item -LiteralPath (Join-Path $sourceRoot "uninstall.ps1") -Destination $InstallRoot -Force
+New-Item -ItemType Directory -Path (Join-Path $InstallRoot "packaging") -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $sourceRoot "packaging\apply-update.ps1") -Destination (Join-Path $InstallRoot "packaging") -Force
 
 if (-not (Test-Path -LiteralPath $venvPython)) {
     Write-Host "[2/4] 创建独立 Python 运行环境"

@@ -55,6 +55,28 @@ def _github_cli() -> str | None:
     return shutil.which("gh.exe") or shutil.which("gh")
 
 
+def _git_github_token() -> str | None:
+    """Read an existing credential without prompting or saving it elsewhere."""
+    executable = shutil.which("git.exe") or shutil.which("git")
+    if not executable:
+        return None
+    environment = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
+    try:
+        result = subprocess.run(
+            [executable, "credential", "fill"],
+            input="protocol=https\nhost=github.com\n\n",
+            cwd=Path.home(), env=environment, text=True, encoding="utf-8",
+            errors="replace", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode:
+        return None
+    fields = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    return fields.get("password") or None
+
+
 def _run_gh(arguments: list[str]) -> subprocess.CompletedProcess[str]:
     executable = _github_cli()
     if not executable:
@@ -69,6 +91,19 @@ def _run_gh(arguments: list[str]) -> subprocess.CompletedProcess[str]:
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         timeout=180,
     )
+    if result.returncode != 0:
+        token = _git_github_token()
+        if token:
+            # Only the child receives the credential; never put it in argv,
+            # Release metadata, logs, or persistent gh configuration.
+            result = subprocess.run(
+                [executable, *arguments], env=dict(os.environ, GH_TOKEN=token),
+                text=True, encoding="utf-8", errors="replace",
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=180,
+            )
+            result.stdout = result.stdout.replace(token, "[redacted]")
+            result.stderr = result.stderr.replace(token, "[redacted]")
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise UpdateError(f"GitHub 请求失败：{detail or result.returncode}")
