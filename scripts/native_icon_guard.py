@@ -29,15 +29,16 @@ def restore(state_path: Path) -> None:
             continue
         current = kernel32.GetFileAttributesW(str(path))
         if current != INVALID_FILE_ATTRIBUTES:
-            kernel32.SetFileAttributesW(str(path), int(attributes))
+            if kernel32.SetFileAttributesW(str(path), int(attributes)):
+                # SHCNE_ATTRIBUTES + SHCNF_PATHW: refresh only this entry.
+                # ASSOCCHANGED would invalidate the global icon cache.
+                try:
+                    ctypes.windll.shell32.SHChangeNotify(0x00000800, 0x0005, ctypes.c_wchar_p(str(path)), None)
+                except Exception:
+                    pass
     try:
         state_path.write_text("{}", encoding="utf-8")
     except OSError:
-        pass
-    # Ask Explorer to refresh its desktop enumeration after the bulk restore.
-    try:
-        ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)
-    except Exception:
         pass
 
 

@@ -1224,22 +1224,26 @@ class DesktopShell:
         temporary.replace(NATIVE_ICON_STATE_PATH)
 
     @staticmethod
-    def _notify_desktop_changed() -> None:
-        try: shell.SHChangeNotify(shellcon.SHCNE_ASSOCCHANGED, 0, None, None)
-        except Exception: pass
+    def _notify_desktop_changed(paths: list[str]) -> None:
+        # Attribute changes are local to these entries. ASSOCCHANGED flushes
+        # the system icon/thumbnail cache and makes unrelated icons go blank.
+        for path in paths:
+            try: shell.SHChangeNotify(shellcon.SHCNE_ATTRIBUTES, shellcon.SHCNF_PATHW, path, None)
+            except Exception: pass
 
     def _restore_attributes(self, paths: set[str] | None = None) -> None:
         invalid = 0xFFFFFFFF
-        restored = False
+        restored: list[str] = []
         selected = set(self.attribute_state) if paths is None else paths
         for raw_path in list(selected):
             attributes = self.attribute_state.get(raw_path)
             if attributes is None: continue
             if Path(raw_path).exists() and self.kernel32.GetFileAttributesW(raw_path) != invalid:
-                self.kernel32.SetFileAttributesW(raw_path, int(attributes)); restored = True
+                if self.kernel32.SetFileAttributesW(raw_path, int(attributes)):
+                    restored.append(raw_path)
             self.attribute_state.pop(raw_path, None)
         self._save_attribute_state()
-        if restored: self._notify_desktop_changed()
+        if restored: self._notify_desktop_changed(restored)
 
     def _ensure_guard(self) -> None:
         if not self.attribute_state or (self.guard and self.guard.poll() is None): return
@@ -1297,9 +1301,11 @@ class DesktopShell:
         if additions:
             # Persist the exact original attributes before changing any item.
             self.attribute_state.update(additions); self._save_attribute_state()
+            changed: list[str] = []
             for raw_path, attributes in additions:
-                self.kernel32.SetFileAttributesW(raw_path, attributes | 0x02 | 0x04)
-            self._notify_desktop_changed()
+                if self.kernel32.SetFileAttributesW(raw_path, attributes | 0x02 | 0x04):
+                    changed.append(raw_path)
+            self._notify_desktop_changed(changed)
         self.hidden = bool(self.attribute_state)
         self._ensure_guard()
 
