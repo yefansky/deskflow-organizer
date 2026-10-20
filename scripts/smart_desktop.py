@@ -1018,7 +1018,7 @@ class ControlService:
 
     def _routes(self) -> None:
         @self.app.get("/health")
-        def health(): return {"ok": True, "time": now_iso(), "desktop": str(self.model.desktop)}
+        def health(): return {"ok": True, "pid": os.getpid(), "time": now_iso(), "desktop": str(self.model.desktop)}
 
         @self.app.get("/layout")
         def layout(): return {"categories": self.model.scan(), "config": self.model.store.data}
@@ -1239,8 +1239,10 @@ class DesktopShell:
             attributes = self.attribute_state.get(raw_path)
             if attributes is None: continue
             if Path(raw_path).exists() and self.kernel32.GetFileAttributesW(raw_path) != invalid:
-                if self.kernel32.SetFileAttributesW(raw_path, int(attributes)):
-                    restored.append(raw_path)
+                current = self.kernel32.GetFileAttributesW(raw_path)
+                if current != int(attributes) and not self.kernel32.SetFileAttributesW(raw_path, int(attributes)):
+                    continue  # Keep recovery evidence when Windows denies the write.
+                if current != int(attributes): restored.append(raw_path)
             self.attribute_state.pop(raw_path, None)
         self._save_attribute_state()
         if restored: self._notify_desktop_changed(restored)
@@ -1288,6 +1290,7 @@ class DesktopShell:
 
     def hide_icons(self, organized_paths: list[str]) -> None:
         """Hide only organized filesystem entries; keep native virtual/new icons."""
+        self.organized_native_paths = list(organized_paths)
         self.listview = self._find_listview()
         if self.listview: self.user32.ShowWindow(self.listview, self.SW_SHOW)
         wanted = {str(Path(path)) for path in organized_paths}
@@ -1301,13 +1304,26 @@ class DesktopShell:
         if additions:
             # Persist the exact original attributes before changing any item.
             self.attribute_state.update(additions); self._save_attribute_state()
-            changed: list[str] = []
-            for raw_path, attributes in additions:
-                if self.kernel32.SetFileAttributesW(raw_path, attributes | 0x02 | 0x04):
-                    changed.append(raw_path)
-            self._notify_desktop_changed(changed)
-        self.hidden = bool(self.attribute_state)
+        changed: list[str] = []
+        self.attribute_errors: dict[str, int] = {}
+        hidden_count = 0
+        for raw_path in wanted & set(self.attribute_state):
+            current = self.kernel32.GetFileAttributesW(raw_path)
+            if current == invalid: continue
+            if current & 0x06 == 0x06:
+                hidden_count += 1
+            elif self.kernel32.SetFileAttributesW(raw_path, current | 0x06):
+                changed.append(raw_path)
+                hidden_count += 1
+            else:
+                self.attribute_errors[raw_path] = int(self.kernel32.GetLastError())
+        if changed: self._notify_desktop_changed(changed)
+        self.hidden = bool(hidden_count)
         self._ensure_guard()
+
+    def retry_icon_attributes(self) -> None:
+        if getattr(self, 'attribute_errors', None):
+            self.hide_icons(self.organized_native_paths)
 
     def restore_icons(self) -> None:
         if self.attribute_state: self._restore_attributes()

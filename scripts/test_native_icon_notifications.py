@@ -18,8 +18,12 @@ class NativeIconNotificationsTest(unittest.TestCase):
         shell.attribute_state = {}
         shell.user32 = Mock()
         shell.kernel32 = Mock()
-        shell.kernel32.GetFileAttributesW.return_value = 32
-        shell.kernel32.SetFileAttributesW.return_value = 1
+        attributes = {}
+        shell.kernel32.GetFileAttributesW.side_effect = lambda p: attributes.get(p, 32)
+        def set_attributes(path, value):
+            attributes[path] = value
+            return 1
+        shell.kernel32.SetFileAttributesW.side_effect = set_attributes
         shell._find_listview = Mock(return_value=1)
         shell._save_attribute_state = Mock()
         shell._ensure_guard = Mock()
@@ -46,6 +50,8 @@ class NativeIconNotificationsTest(unittest.TestCase):
             path = str(Path(directory, 'example.lnk'))
             Path(path).touch()
             shell.attribute_state[path] = 32
+            shell.kernel32.GetFileAttributesW.side_effect = None
+            shell.kernel32.GetFileAttributesW.return_value = 38
             shell.hide_icons([])
         shell.kernel32.SetFileAttributesW.assert_called_once_with(path, 32)
         shell._notify_desktop_changed.assert_called_once_with([path])
@@ -53,10 +59,41 @@ class NativeIconNotificationsTest(unittest.TestCase):
 
     def test_failed_hide_does_not_emit_change(self):
         shell = self.make_shell()
+        shell.kernel32.SetFileAttributesW.side_effect = None
         shell.kernel32.SetFileAttributesW.return_value = 0
+        shell.kernel32.GetLastError.return_value = 5
         with patch.object(smart_desktop.shell, 'SHChangeNotify') as notify:
             shell.hide_icons(['G:/Desktop/example.lnk'])
         notify.assert_not_called()
+
+    def test_failed_hide_is_retried_and_preserves_original(self):
+        shell = self.make_shell()
+        path = str(Path('G:/Desktop/example.lnk'))
+        real_set = shell.kernel32.SetFileAttributesW.side_effect
+        shell.kernel32.SetFileAttributesW.side_effect = None
+        shell.kernel32.SetFileAttributesW.return_value = 0
+        shell.kernel32.GetLastError.return_value = 5
+        shell.hide_icons([path])
+        self.assertFalse(shell.hidden)
+        self.assertEqual(shell.attribute_errors, {path: 5})
+        shell.kernel32.SetFileAttributesW.side_effect = real_set
+        shell.hide_icons([path])
+        self.assertEqual(shell.attribute_state[path], 32)
+        self.assertTrue(shell.hidden)
+        self.assertEqual(shell.attribute_errors, {})
+
+    def test_failed_restore_retains_recovery_record(self):
+        shell = self.make_shell()
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory, 'example.lnk'))
+            Path(path).touch()
+            shell.attribute_state[path] = 32
+            shell.kernel32.GetFileAttributesW.side_effect = None
+            shell.kernel32.GetFileAttributesW.return_value = 38
+            shell.kernel32.SetFileAttributesW.side_effect = None
+            shell.kernel32.SetFileAttributesW.return_value = 0
+            shell._restore_attributes()
+            self.assertEqual(shell.attribute_state, {path: 32})
 
     def test_crash_guard_restores_with_path_notification(self):
         kernel = Mock()

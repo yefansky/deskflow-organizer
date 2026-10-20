@@ -23,12 +23,15 @@ def restore(state_path: Path) -> None:
     except (OSError, json.JSONDecodeError):
         return
     kernel32 = ctypes.windll.kernel32
+    remaining = {}
     for raw_path, attributes in state.items():
         path = Path(raw_path)
         if not path.exists():
             continue
         current = kernel32.GetFileAttributesW(str(path))
         if current != INVALID_FILE_ATTRIBUTES:
+            if current == int(attributes):
+                continue
             if kernel32.SetFileAttributesW(str(path), int(attributes)):
                 # SHCNE_ATTRIBUTES + SHCNF_PATHW: refresh only this entry.
                 # ASSOCCHANGED would invalidate the global icon cache.
@@ -36,8 +39,10 @@ def restore(state_path: Path) -> None:
                     ctypes.windll.shell32.SHChangeNotify(0x00000800, 0x0005, ctypes.c_wchar_p(str(path)), None)
                 except Exception:
                     pass
+            else:
+                remaining[raw_path] = attributes
     try:
-        state_path.write_text("{}", encoding="utf-8")
+        state_path.write_text(json.dumps(remaining, ensure_ascii=False), encoding="utf-8")
     except OSError:
         pass
 

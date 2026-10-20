@@ -41,6 +41,9 @@ def main():
     if "--overlay" in sys.argv:
         sys.argv.remove("--overlay")
         from smart_desktop import main as run
+    elif "--public-icons" in sys.argv:
+        sys.argv.remove("--public-icons")
+        from public_desktop_icons import main as run
     elif "--guard" in sys.argv:
         sys.argv.remove("--guard")
         from native_icon_guard import main as run

@@ -15,7 +15,7 @@ def command(role="manager", *arguments):
     python = Path(sys.executable)
     if role != "mcp" and python.with_name("pythonw.exe").exists():
         python = python.with_name("pythonw.exe")
-    scripts = {"manager": "deskflow_manager.py", "overlay": "smart_desktop.py", "guard": "native_icon_guard.py", "mcp": "mcp_server.py"}
+    scripts = {"manager": "deskflow_manager.py", "overlay": "smart_desktop.py", "guard": "native_icon_guard.py", "mcp": "mcp_server.py", "public-icons": "public_desktop_icons.py"}
     return [str(python), str(APP_ROOT / "scripts" / scripts[role]), *map(str, arguments)]
 
 

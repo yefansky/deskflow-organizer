@@ -392,6 +392,12 @@ class Manager:
                 self.stop_app()
             elif action == "check-update":
                 self.root.deiconify(); self.root.lift(); self.check_for_updates()
+            elif action == "repair-public-icons":
+                try:
+                    from public_desktop_icons import launch_elevated
+                    launch_elevated()
+                except Exception as exc:
+                    messagebox.showerror("公共桌面权限", str(exc), parent=self.root)
             elif action == "update-result":
                 self.handle_update_result(target)
             elif action == "update-error":
@@ -413,6 +419,7 @@ class Manager:
             pystray.MenuItem("当前屏幕弹性重排",self.tray_arrange_current),
             pystray.MenuItem("移动全部到指定屏幕并弹性排版",monitor_menu),
             pystray.MenuItem("暂停并显示原生图标",self.enqueue_tray_action("stop")),
+            pystray.MenuItem("修复公共桌面重复图标（需要管理员确认）",self.enqueue_tray_action("repair-public-icons")),
             pystray.MenuItem("检查 GitHub Release 更新",self.enqueue_tray_action("check-update")),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出 DESKFLOW",self.enqueue_tray_action("exit")),

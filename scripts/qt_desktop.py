@@ -813,6 +813,7 @@ class QtOrganizerUI:
 
     def tick(self) -> None:
         self.shell.keep_panels_above_desktop_backdrop()
+        self.shell.retry_icon_attributes()
         rerender = False
         arrange = False
         recovery = False
