@@ -18,7 +18,7 @@ DESKFLOW 是面向 Windows 的桌面覆盖层与托盘管理器。它扫描桌�
 
 应用启动约 12 秒后自动检查 GitHub 最新正式 Release，也可从管理器或托盘手动“检查更新”。发现新版本后提示确认，下载并验证 SHA-256，等待旧进程退出，再安装并重启。升级保留桌面分类、布局、标签和管理器设置。更新失败的交接日志位于 `%LOCALAPPDATA%\DeskflowOrganizer\updates\版本号\`。
 
-仓库目前私有，更新需要本机安装 [GitHub CLI](https://cli.github.com/)，并使用有仓库读取权限的账号。优先使用 `gh auth login` 的登录态；请求失败时，自动尝试 Git 已保存的 GitHub 凭据，不弹出登录窗口。回退凭据只传入本次更新请求的子进程，不写入文件或修改 GitHub CLI 登录配置。没有有效凭据时请执行 `gh auth login`。应用不内置开发者凭据；若仓库以后公开，可直接通过 HTTPS 更新。后台检查失败只显示状态，手动检查会展示具体错误。
+本仓库及正式 Release 已公开。安装版使用内置 HTTPS 匿名检查版本、下载安装包，不需要 GitHub 账号、登录、GitHub CLI、Git 或 Python，也不读取本机 Git/GitHub 凭据。网络不可用、服务限流或发布文件暂不可用时会提示稍后重试；后台检查失败只显示状态，手动检查会展示具体错误。
 
 v0.2 的 ZIP 更新器仍可下载 `DESKFLOW-windows-x64.zip`，它现在是迁移到 EXE 版的兼容包。已有 Python 快捷方式和 MCP 脚本入口会转发到安装后的 EXE。旧 `.venv` 不自动清理，以免破坏仍引用它的客户端配置。
 

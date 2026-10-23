@@ -51,82 +51,37 @@ def is_newer_version(candidate: str, installed: str | None = None) -> bool:
     return version_tuple(candidate) > version_tuple(installed or current_version())
 
 
-def _github_cli() -> str | None:
-    return shutil.which("gh.exe") or shutil.which("gh")
-
-
-def _git_github_token() -> str | None:
-    """Read an existing credential without prompting or saving it elsewhere."""
-    executable = shutil.which("git.exe") or shutil.which("git")
-    if not executable:
-        return None
-    environment = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
-    try:
-        result = subprocess.run(
-            [executable, "credential", "fill"],
-            input="protocol=https\nhost=github.com\n\n",
-            cwd=Path.home(), env=environment, text=True, encoding="utf-8",
-            errors="replace", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=15,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode:
-        return None
-    fields = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
-    return fields.get("password") or None
-
-
-def _run_gh(arguments: list[str]) -> subprocess.CompletedProcess[str]:
-    executable = _github_cli()
-    if not executable:
-        raise UpdateError("这是私有仓库，需要先安装 GitHub CLI 并执行 gh auth login。")
-    result = subprocess.run(
-        [executable, *arguments],
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        timeout=180,
-    )
-    if result.returncode != 0:
-        token = _git_github_token()
-        if token:
-            # Only the child receives the credential; never put it in argv,
-            # Release metadata, logs, or persistent gh configuration.
-            result = subprocess.run(
-                [executable, *arguments], env=dict(os.environ, GH_TOKEN=token),
-                text=True, encoding="utf-8", errors="replace",
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=180,
-            )
-            result.stdout = result.stdout.replace(token, "[redacted]")
-            result.stderr = result.stderr.replace(token, "[redacted]")
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        raise UpdateError(f"GitHub 请求失败：{detail or result.returncode}")
-    return result
+def _request_failure(error: OSError, action: str) -> UpdateError:
+    """Describe public-service failures without requesting developer login."""
+    if isinstance(error, urllib.error.HTTPError):
+        headers = error.headers or {}
+        if error.code == 429 or (error.code == 403 and (
+            headers.get("X-RateLimit-Remaining") == "0" or headers.get("Retry-After")
+        )):
+            return UpdateError(f"{action}暂时受到服务限流，请稍后重试。")
+        if error.code == 404:
+            return UpdateError(f"{action}未找到发布文件，请稍后重试或查看软件发布页面。")
+        if error.code in (401, 403):
+            return UpdateError(f"{action}的公开下载服务暂时不可访问，请稍后重试。")
+        return UpdateError(f"{action}服务返回 HTTP {error.code}，请稍后重试。")
+    return UpdateError(f"{action}失败，请检查网络连接后重试。")
 
 
 def latest_release() -> dict[str, Any]:
-    """Return the newest stable Release, using gh for private repositories."""
-    if _github_cli():
-        try:
-            data = json.loads(_run_gh(["api", f"repos/{REPOSITORY}/releases/latest"]).stdout)
-            data["transport"] = "gh"
-            return data
-        except (json.JSONDecodeError, UpdateError):
-            # A public repository still works through HTTPS when gh is present
-            # but not logged in. Keep that path available before reporting.
-            pass
+    """Read the public Release using built-in HTTPS, without tools or credentials."""
     request = urllib.request.Request(RELEASE_API, headers={"Accept": "application/vnd.github+json", "User-Agent": "DESKFLOW-Updater"})
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             data = json.loads(response.read().decode("utf-8"))
-    except (OSError, urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError) as exc:
-        raise UpdateError("无法读取 GitHub Release。私有仓库请先安装 GitHub CLI 并执行 gh auth login。") from exc
+    except OSError as exc:
+        raise _request_failure(exc, "检查更新") from exc
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise UpdateError("更新服务返回了无效的版本信息，请稍后重试。") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("assets"), list):
+        raise UpdateError("更新服务返回了无效的版本信息，请稍后重试。")
+    version_tuple(str(data.get("tag_name", "")))
+    if data.get("draft") or data.get("prerelease"):
+        raise UpdateError("更新服务尚未提供正式版本，请稍后重试。")
     data["transport"] = "https"
     return data
 
@@ -163,18 +118,15 @@ def download_and_verify(release: dict[str, Any], destination: Path | None = None
     for path in (package, checksum):
         path.unlink(missing_ok=True)
 
-    if release.get("transport") == "gh":
-        _run_gh([
-            "release", "download", tag, "--repo", REPOSITORY,
-            "--pattern", package_name, "--pattern", checksum_name,
-            "--dir", str(destination), "--clobber",
-        ])
-    else:
-        try:
-            _download_https(str(assets[package_name]["browser_download_url"]), package)
-            _download_https(str(assets[checksum_name]["browser_download_url"]), checksum)
-        except (KeyError, OSError, urllib.error.HTTPError, urllib.error.URLError) as exc:
-            raise UpdateError(f"下载 Release 更新包失败：{exc}") from exc
+    # Ignore transport hints in metadata: installed clients always use anonymous
+    # HTTP(S), even if an earlier caller cached a Release obtained through gh.
+    try:
+        _download_https(str(assets[package_name]["browser_download_url"]), package)
+        _download_https(str(assets[checksum_name]["browser_download_url"]), checksum)
+    except OSError as exc:
+        raise _request_failure(exc, "下载更新") from exc
+    except (KeyError, ValueError) as exc:
+        raise UpdateError("更新服务缺少有效的下载地址，请稍后重试。") from exc
 
     try:
         expected = checksum.read_text(encoding="utf-8-sig").split()[0].lower()
