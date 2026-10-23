@@ -32,7 +32,9 @@ v0.2 的 ZIP 更新器仍可下载 `DESKFLOW-windows-x64.zip`，它现在是迁�
 
 安装版自带标准输入输出 MCP 服务，入口为安装目录的 `DeskflowMCP.exe`。它支持目录读取、摘要、标签、批量归类、分类管理、布局、样式、排序和位置调整，服务仅连接本机。
 
-配置示例和操作顺序见 [MCP 接入说明](docs/MCP.md)。旧版 `scripts/mcp_server.py` 配置也可继续使用。更新时 MCP 连接会退出以释放文件占用，升级后在客户端重新连接即可。
+运行 `DeskflowMCP.exe --print-config` 可输出当前机器的绝对路径配置，无需安装开发环境。接入后 agent 可通过标准 `tools/list` 自动发现18个工具，通过 `resources/list` / `prompts/list` 发现整理说明；紧凑目录提供分类、图标顺序与人工归类，`get_desktop_arrangement` 提供保存的块位置和排布。批量整理支持无写入预演，默认保护人工分类。
+
+配置示例、协议版本、错误结构及诊断参数见 [MCP 接入说明](docs/MCP.md)。旧版 `scripts/mcp_server.py` 配置也可继续使用。更新时 MCP 连接会退出以释放文件占用，升级后在客户端重新连接即可。
 
 ## 卸载
 

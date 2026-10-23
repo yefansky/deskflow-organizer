@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -11,6 +12,7 @@ from smart_desktop import OrganizerModel
 class FakeStore:
     def __init__(self, desktop: Path) -> None:
         self.saved = 0
+        self.lock = threading.RLock()
         self.data = {
             "desktop": str(desktop),
             "overrides": {}, "pending_inbox": {}, "seen": {}, "visual_assets": {},

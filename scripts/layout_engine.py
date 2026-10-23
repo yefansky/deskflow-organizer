@@ -13,6 +13,25 @@ class Rect:
 def overlaps(a: Rect, b: Rect, gap: int = 10) -> bool:
     return not (a.x + a.width + gap <= b.x or b.x + b.width + gap <= a.x or a.y + a.height + gap <= b.y or b.y + b.height + gap <= a.y)
 
+def can_place_rectangle(candidate: Rect, occupied: list[Rect]) -> bool:
+    """User placement never moves neighbours; touching edges are allowed."""
+    return all(other.key == candidate.key or not overlaps(candidate, other, gap=0)
+               for other in occupied)
+
+def restore_rectangles(items: list[Rect], bounds: tuple[int, int, int, int], margin: int = 8) -> dict[str, Rect]:
+    """Preserve a valid saved layout exactly; repair only invalid display profiles.
+
+    Automatic packing has a visual gap. User placement only prohibits overlap,
+    so repacking every saved layout with the automatic gap loses manual intent.
+    """
+    left, top, right, bottom = bounds
+    valid = all(item.width > 0 and item.height > 0 and item.x >= left + margin
+                and item.y >= top + margin and item.x + item.width <= right - margin
+                and item.y + item.height <= bottom - margin
+                and can_place_rectangle(item, items) for item in items)
+    if valid: return {item.key: item for item in items}
+    return pack_rectangles(items, bounds, margin=margin, gap=0)
+
 def resize_rectangle(rect: Rect, edge: str, dx: int, dy: int, bounds: tuple[int, int, int, int], margin: int = 12, minimum_width: int = 210, minimum_height: int = 120) -> Rect:
     """Resize from any edge/corner while keeping the opposite edge fixed."""
     left, top, right, bottom = bounds

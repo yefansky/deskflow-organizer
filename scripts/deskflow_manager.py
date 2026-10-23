@@ -12,6 +12,9 @@ from win32com.client import Dispatch
 import win32api
 from release_updater import current_version, download_and_verify, is_newer_version, latest_release, spawn_update
 from app_runtime import APP_ROOT, RESOURCE_ROOT, FROZEN, command, watch_update
+from diagnostics import configure_logging, get_logger, logging_arguments, timed_operation, traced
+
+logger = get_logger(__name__)
 
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "DeskflowOrganizer"
@@ -161,9 +164,13 @@ class Manager:
         self.monitor_picker.pack(side="left")
         self.action_button(recovery,"移动全部并弹性排版",self.move_all_and_arrange,tone="violet").pack(side="right")
         tk.Label(body,text="安装仅建立本机入口和配置；卸载不会删除桌面文件。托盘菜单可重新打开管理器、启用整理或退出并恢复原生图标。",wraplength=590,justify="left",fg="#94a6bf",bg=bg).pack(anchor="w",padx=28,pady=(4,8))
+    @traced("manager.health_request")
     def online(self):
         try: urlopen("http://127.0.0.1:8765/health",timeout=0.8).read(); return True
-        except Exception: return False
+        except Exception:
+            logger.debug("manager.health_unavailable", exc_info=True)
+            return False
+    @traced("manager.api_post")
     def api_post(self, path: str):
         request = Request(f"http://127.0.0.1:8765{path}", data=b"{}", method="POST", headers={"Content-Type": "application/json"})
         return urlopen(request, timeout=1).read()
@@ -228,11 +235,29 @@ class Manager:
         if self.apply_monitor_and_arrange(target):
             self.status.set(f"显示状态：已移动全部块到 {selection} 并完成弹性排版")
     def refresh(self):
-        live=self.online(); installed=self.data.get("installed",False)
+        # Localhost can still time out. Never make the Tk input thread wait for
+        # an HTTP request, and keep only one probe / scheduled refresh active.
+        if not getattr(self, "_health_pending", False):
+            self._health_pending = True
+            def probe():
+                try:
+                    live = self.online()
+                except Exception:
+                    logger.exception("manager.health_probe.failed")
+                    live = False
+                self.tray_actions.put(("health-result", live))
+            threading.Thread(target=probe, name="deskflow-health", daemon=True).start()
+        self.update_status_controls(getattr(self, "_online_cached", False))
+        previous = getattr(self, "_refresh_scheduled", None)
+        if previous:
+            self.root.after_cancel(previous)
+        self._refresh_scheduled = self.root.after(1500,self.refresh)
+
+    def update_status_controls(self, live):
+        installed=self.data.get("installed",False)
         self.status.set(f"安装状态：{'已安装' if installed else '未安装'}\n显示状态：{'正在运行（本机服务已连接）' if live else '未运行'}\n自动启用：{'已开启' if self.data.get('autostart') else '未开启'}")
         self.install.configure(state="disabled" if installed else "normal"); self.enable.configure(state="normal" if installed else "disabled")
         self.stop.configure(state="normal" if live else "disabled"); self.remove.configure(state="normal" if installed else "disabled")
-        self.root.after(1500,self.refresh)
     def check_for_updates(self, silent=False):
         if self.update_busy: return
         self.update_silent = silent
@@ -311,26 +336,69 @@ class Manager:
         try:
             winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key + r"\command"); winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key)
         except FileNotFoundError: pass
+    @traced("manager.enable_app")
     def enable_app(self):
         if not self.data.get("installed"): self.install_app()
         if not self.online():
-            proc=subprocess.Popen(command("overlay"),cwd=APP_ROOT,creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
+            proc=subprocess.Popen(command("overlay", *logging_arguments()),cwd=APP_ROOT,creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
             self.data["pid"]=proc.pid; save(self.data)
         self.refresh()
+    @traced("manager.open_settings")
     def open_settings(self):
-        self.enable_app()
-        try:
-            self.api_post("/open-settings")
-        except Exception:
-            messagebox.showinfo("DESKFLOW", "整理器正在启动，请稍后再次打开设置。", parent=self.root)
+        if getattr(self, "_settings_pending", False):
+            return
+        if not self.data.get("installed"):
+            self.install_app()
+        self._settings_pending = True
+        def request_settings():
+            pid = None
+            try:
+                if not self.online():
+                    pid = subprocess.Popen(command("overlay", *logging_arguments()), cwd=APP_ROOT,
+                                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).pid
+                for _ in range(15):
+                    if self.online():
+                        break
+                    time.sleep(.1)
+                self.api_post("/open-settings")
+                self.tray_actions.put(("settings-result", (pid, None)))
+            except Exception as error:
+                logger.exception("manager.open_settings.failed")
+                self.tray_actions.put(("settings-result", (pid, str(error))))
+        threading.Thread(target=request_settings, name="deskflow-settings-request", daemon=True).start()
+    @traced("manager.apply_preferences")
     def apply_preferences(self):
-        self.enable_app()
         payload={"cell_size":self.cell_size.get(),"font_size":self.font_size.get(),"layout_footprint":self.layout_footprint.get()/100,"alpha":self.alpha.get()/100}
         if self.data.get("background"): payload["background"]=self.data["background"]
-        try:
-            req=Request("http://127.0.0.1:8765/settings",data=json.dumps(payload).encode(),method="POST",headers={"Content-Type":"application/json"})
-            urlopen(req,timeout=2).read()
-        except Exception: messagebox.showinfo("DESKFLOW", "整理器正在启动，请稍后应用偏好。",parent=self.root)
+        if getattr(self, "_preferences_pending", False):
+            self._preferences_latest = payload
+            return
+        if not self.data.get("installed"):
+            self.install_app()
+        self.request_preferences(payload)
+
+    def request_preferences(self, payload):
+        self._preferences_pending = True
+        self._preferences_latest = None
+        def request():
+            pid = None
+            try:
+                if not self.online():
+                    pid = subprocess.Popen(command("overlay", *logging_arguments()), cwd=APP_ROOT,
+                                           creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0)).pid
+                for _ in range(15):
+                    if self.online():
+                        break
+                    time.sleep(.1)
+                with timed_operation("manager.preferences_request"):
+                    req=Request("http://127.0.0.1:8765/settings",data=json.dumps(payload).encode(),method="POST",headers={"Content-Type":"application/json"})
+                    with urlopen(req,timeout=2) as response:
+                        response.read()
+                self.tray_actions.put(("preferences-result", (pid, None)))
+            except Exception as error:
+                logger.exception("manager.apply_preferences.failed")
+                self.tray_actions.put(("preferences-result", (pid, str(error))))
+        threading.Thread(target=request, name="deskflow-preferences", daemon=True).start()
     def choose_background(self):
         color=colorchooser.askcolor(color=self.data.get("background","#101827"),parent=self.root)[1]
         if color: self.data["background"]=color; save(self.data)
@@ -400,6 +468,29 @@ class Manager:
                     messagebox.showerror("公共桌面权限", str(exc), parent=self.root)
             elif action == "update-result":
                 self.handle_update_result(target)
+            elif action == "health-result":
+                self._health_pending = False
+                self._online_cached = bool(target)
+                self.update_status_controls(bool(target))
+            elif action == "settings-result":
+                self._settings_pending = False
+                pid, error = target
+                if pid:
+                    self.data["pid"] = pid
+                    save(self.data)
+                if error:
+                    messagebox.showinfo("DESKFLOW", f"未能打开设置，请重试。\n{error}", parent=self.root)
+            elif action == "preferences-result":
+                self._preferences_pending = False
+                pid, error = target
+                if pid:
+                    self.data["pid"] = pid
+                    save(self.data)
+                if error:
+                    messagebox.showinfo("DESKFLOW", f"未能应用偏好，请重试。\n{error}", parent=self.root)
+                latest = self._preferences_latest
+                if latest is not None:
+                    self.request_preferences(latest)
             elif action == "update-error":
                 self.handle_update_error(str(target))
             elif action == "update-ready":
@@ -451,10 +542,12 @@ class Manager:
         if STATE.exists(): STATE.unlink()
         self.data={"installed":False,"pid":None,"autostart":False}; save(self.data); self.auto.set(False); self.refresh()
 def main():
-    parser=argparse.ArgumentParser(add_help=False)
+    parser=argparse.ArgumentParser()
     parser.add_argument("--install",action="store_true")
     parser.add_argument("--start",action="store_true",help="start the manager and desktop blocks")
+    parser.add_argument("--log-level", choices=("debug", "info", "warn", "error"), help="enable local 200 KiB rotating diagnostics beside the program")
     args,_unknown=parser.parse_known_args()
+    configure_logging(args.log_level, role="manager")
     kernel32 = ctypes.windll.kernel32
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
     kernel32.CreateMutexW.restype = ctypes.c_void_p

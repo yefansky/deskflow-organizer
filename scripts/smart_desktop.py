@@ -39,8 +39,11 @@ import win32con
 import win32gui
 import win32ui
 from win32com.client import Dispatch
-from layout_engine import Rect, overlaps, pack_rectangles, resize_rectangle
+from layout_engine import Rect, overlaps, pack_rectangles, resize_rectangle, can_place_rectangle, restore_rectangles
 from app_runtime import command, APP_ROOT
+from diagnostics import configure_logging, get_logger, logging_arguments, traced
+
+logger = get_logger(__name__)
 try:
     import winreg
 except ImportError:
@@ -327,7 +330,95 @@ class OrganizerModel:
         roots = (self.desktop, COMMON_DESKTOP)
         return tuple(dict.fromkeys(root for root in roots if root.exists()))
 
+    @traced("desktop.scan")
     def scan(self) -> dict[str, list[dict[str, Any]]]:
+        preview, baseline = self._snapshot_model()
+        groups, vanished = self._prepare_rebase(preview._scan_locked(), preview)
+        with self.store.lock:
+            missing = object()
+            changed = False
+            for field in ("seen", "pending_inbox", "tip_summaries", "document_summaries", "folder_summaries"):
+                before = baseline.get(field, {})
+                after = preview.store.data.get(field, {})
+                target = self.store.data.setdefault(field, {})
+                for key in set(before) | set(after):
+                    if key in vanished or self._renamed_since_snapshot(key, preview): continue
+                    if field in {"tip_summaries", "document_summaries", "folder_summaries"} and (
+                        self.store.data.get("item_metadata", {}).get(key) != baseline.get("item_metadata", {}).get(key)
+                    ): continue
+                    old, new = before.get(key, missing), after.get(key, missing)
+                    if old != new and target.get(key, missing) == old:
+                        if new is missing: target.pop(key, None)
+                        else: target[key] = new
+                        changed = True
+            roots = self.store.data.setdefault("scanned_roots", [])
+            for root in preview.store.data.get("scanned_roots", []):
+                if root not in roots:
+                    roots.append(root)
+                    changed = True
+            groups = self._authoritative_groups(groups, preview)
+            if changed: self.store.save()
+        return groups
+
+    def _snapshot_model(self):
+        """Copy model state briefly; filesystem/Shell work uses a private lock."""
+        import copy
+        with self.store.lock:
+            baseline = copy.deepcopy(self.store.data)
+            renamed = dict(getattr(self.store, "_rename_generations", {}))
+        preview = copy.copy(self)
+        preview.store = copy.copy(self.store)
+        preview.store.data = copy.deepcopy(baseline)
+        preview.store.lock = threading.RLock()
+        preview.store.save = lambda: None
+        preview._snapshot_renames = renamed
+        return preview, baseline
+
+    def _renamed_since_snapshot(self, key, preview):
+        return (getattr(self.store, "_rename_generations", {}).get(key) !=
+                getattr(preview, "_snapshot_renames", {}).get(key))
+
+    def _prepare_rebase(self, groups, preview):
+        """All filesystem and automatic classification work stays outside commit locks."""
+        import copy
+        automatic_store = copy.copy(preview.store)
+        automatic_store.data = dict(preview.store.data, overrides={})
+        result, vanished = {}, set()
+        for category, items in groups.items():
+            result[category] = []
+            for source in items:
+                item = dict(source)
+                if "path" in item and not Path(item["path"]).exists():
+                    vanished.add(item["name"].lower())
+                    continue
+                item["_automatic_category"] = (Classifier.category(Path(item["path"]), automatic_store)
+                    if item.get("manual") and "path" in item else category)
+                result[category].append(item)
+        return result, vanished
+
+    def _authoritative_groups(self, groups, preview):
+        """Rebase classification against current manual decisions under Store lock."""
+        overrides = self.store.data.get("overrides", {})
+        pending = self.store.data.get("pending_inbox", {})
+        result = {category.id: [] for category in all_categories(self.store)}
+        for category, items in groups.items():
+            for source in items:
+                item = dict(source)
+                key = item["name"].lower()
+                if self._renamed_since_snapshot(key, preview): continue
+                automatic = item.pop("_automatic_category", category)
+                target = overrides.get(key)
+                if target is None:
+                    if key in pending: target = "inbox"
+                    elif item.get("manual"):
+                        target = automatic
+                    else: target = category
+                item["manual"] = key in overrides
+                item["native_pending"] = key in pending and target == "inbox"
+                result.setdefault(target, []).append(item)
+        return result
+
+    def _scan_locked(self) -> dict[str, list[dict[str, Any]]]:
         result = {c.id: [] for c in all_categories(self.store)}
         entries: list[tuple[Path, Path]] = []
         for root in self.desktop_roots:
@@ -368,6 +459,7 @@ class OrganizerModel:
             result.setdefault(category, []).append({
                 "name": item.name, "path": str(item), "kind": "folder" if item.is_dir() else item.suffix.lower().lstrip(".") or "file",
                 "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                "revision": f"{stat.st_mtime_ns}:{stat.st_size}",
                 "manual": key in self.store.data["overrides"],
                 "native_pending": key in pending and category == "inbox",
             })
@@ -396,6 +488,7 @@ class OrganizerModel:
         if changed: self.store.save()
         return result
 
+    @traced("desktop.signature")
     def desktop_signature(self) -> tuple[tuple[str, int, int], ...]:
         """Cheap watcher signature; avoids repainting unchanged panels."""
         try:
@@ -542,6 +635,10 @@ class OrganizerModel:
         return profile
 
     def set_category(self, name: str, category: str, manual: bool = True) -> None:
+        with self.store.lock:
+            self._set_category_locked(name, category, manual)
+
+    def _set_category_locked(self, name: str, category: str, manual: bool) -> None:
         if category not in {c.id for c in all_categories(self.store)}: raise ValueError("unknown category")
         key = name.lower()
         if manual: self.store.data["overrides"][key] = category
@@ -551,7 +648,29 @@ class OrganizerModel:
         self.store.data.setdefault("pending_inbox", {}).pop(key, None)
         self.store.save()
 
+    def forget_item_state(self, name: str) -> None:
+        """Forget an already recycled item; never performs filesystem operations."""
+        with self.store.lock:
+            key = name.casefold()
+            self._advance_item_generation(key)
+            data = self.store.data
+            for field in ("overrides", "pending_inbox", "seen", "visual_assets", "tip_summaries"):
+                data.get(field, {}).pop(key, None)
+            for names in data.get("item_orders", {}).values():
+                if isinstance(names, list): names[:] = [value for value in names if value.casefold() != key]
+            self.store.save()
+
+    def _advance_item_generation(self, key):
+        generations = getattr(self.store, "_rename_generations", None)
+        if generations is None:
+            generations = self.store._rename_generations = {}
+        generations[key] = generations.get(key, 0) + 1
+
     def rename_item(self, path_text: str, new_label: str) -> dict[str, str]:
+        with self.store.lock:
+            return self._rename_item_locked(path_text, new_label)
+
+    def _rename_item_locked(self, path_text: str, new_label: str) -> dict[str, str]:
         """Rename one desktop item and migrate all filename-keyed presentation data."""
         path = Path(path_text)
         if not path.exists():
@@ -598,6 +717,7 @@ class OrganizerModel:
             raise ValueError(f"Windows 无法重命名该项：{exc}") from exc
 
         old_key, new_key = path.name.lower(), target.name.lower()
+        self._advance_item_generation(old_key)
         data = self.store.data
         for field in (
             "overrides", "pending_inbox", "seen", "visual_assets", "markdown_summaries",
@@ -616,8 +736,9 @@ class OrganizerModel:
         return {"old_name": path.name, "new_name": target.name, "path": str(target)}
 
     def promote_new(self, name: str) -> None:
-        self.store.data["seen"].setdefault(name.lower(), {})["first_seen_epoch"] = time.time()
-        self.store.save()
+        with self.store.lock:
+            self.store.data["seen"].setdefault(name.lower(), {})["first_seen_epoch"] = time.time()
+            self.store.save()
 
     @staticmethod
     def low_signal_tip(value: str) -> bool:
@@ -725,9 +846,11 @@ class OrganizerModel:
         if not wanted or len(wanted) > 50:
             raise ValueError("provide 1..50 item names")
         if refresh:
-            tips = self.store.data.setdefault("tip_summaries", {})
-            for key in wanted:
-                tips.pop(key, None)
+            with self.store.lock:
+                tips = self.store.data.setdefault("tip_summaries", {})
+                for key in wanted:
+                    self._advance_item_generation(key)
+                    tips.pop(key, None)
         groups = self.scan()
         matches: dict[str, list[tuple[str, dict[str, Any]]]] = {}
         for category, items in groups.items():
@@ -778,10 +901,28 @@ class OrganizerModel:
             raise ValueError("at most 12 tags are allowed per item")
         return result
 
-    def organize_items(self, operations: list[dict[str, Any]], dry_run: bool = False) -> dict[str, Any]:
+    def organize_items(self, operations: list[dict[str, Any]], dry_run: bool = False,
+                       allow_manual: bool = False) -> dict[str, Any]:
+        if type(dry_run) is not bool or type(allow_manual) is not bool:
+            raise ValueError("dry_run and allow_manual must be booleans")
+        preview, _baseline = self._snapshot_model()
+        groups, _vanished = self._prepare_rebase(preview.scan(), preview)
+        with self.store.lock:
+            groups = self._authoritative_groups(groups, preview)
+            result = self._organize_items_locked(operations, dry_run, allow_manual, groups)
+        if not dry_run:
+            after = self.scan()
+            final_categories = {item["name"].casefold(): category for category, items in after.items() for item in items}
+            for change in result["changes"]:
+                change["to"] = final_categories.get(change["name"].casefold(), change["to"])
+        return result
+
+    def _organize_items_locked(self, operations: list[dict[str, Any]], dry_run: bool,
+                               allow_manual: bool, groups) -> dict[str, Any]:
+        if type(dry_run) is not bool or type(allow_manual) is not bool:
+            raise ValueError("dry_run and allow_manual must be booleans")
         if not isinstance(operations, list) or not 1 <= len(operations) <= 200:
             raise ValueError("operations must contain 1..200 items")
-        groups = self.scan()
         by_name: dict[str, list[tuple[str, dict[str, Any]]]] = {}
         for category, items in groups.items():
             for item in items:
@@ -792,6 +933,16 @@ class OrganizerModel:
         for operation in operations:
             if not isinstance(operation, dict) or not isinstance(operation.get("name"), str):
                 raise ValueError("every operation requires an item name")
+            if set(operation) - {"name", "category", "reset_category", "summary", "tags", "tag_mode"}:
+                raise ValueError("unknown operation fields")
+            for field in ("category", "summary", "tag_mode"):
+                if field in operation and not isinstance(operation[field], str):
+                    raise ValueError(f"{field} must be a string")
+            if "reset_category" in operation and type(operation["reset_category"]) is not bool:
+                raise ValueError("reset_category must be a boolean")
+            if "tags" in operation and (not isinstance(operation["tags"], list)
+                                        or any(not isinstance(tag, str) for tag in operation["tags"])):
+                raise ValueError("tags must be an array of strings")
             key = operation["name"].strip().casefold()
             if key in seen_names:
                 raise ValueError(f"duplicate operation for: {operation['name']}")
@@ -811,6 +962,11 @@ class OrganizerModel:
                 raise ValueError(f"unknown category: {category}")
             if category is not None and reset_category:
                 raise ValueError("category and reset_category cannot be used together")
+            if not allow_manual and any(
+                matched_item.get("manual") and (reset_category or (category is not None and category != matched_category))
+                for matched_category, matched_item in matches
+            ):
+                raise ValueError(f"manual classification protected: {operation['name']}; user authorization requires allow_manual=true")
             if "tag_mode" in operation and "tags" not in operation:
                 raise ValueError("tag_mode requires tags")
             if category is None and not reset_category and "summary" not in operation and "tags" not in operation:
@@ -876,20 +1032,32 @@ class OrganizerModel:
                         metadata.pop(key, None)
                     tips.pop(key, None)
             self.store.save()
-        after = self.scan()
-        final_categories = {item["name"].casefold(): category for category, items in after.items() for item in items}
-        for change in preview:
-            change["to"] = final_categories.get(change["name"].casefold(), change["to"])
         return {"ok": True, "dry_run": False, "changes": preview}
 
     def manage_categories(self, actions: list[dict[str, Any]], dry_run: bool = False) -> dict[str, Any]:
+        if type(dry_run) is not bool:
+            raise ValueError("dry_run must be a boolean")
+        preview, _baseline = self._snapshot_model()
+        groups, _vanished = self._prepare_rebase(preview.scan(), preview)
+        with self.store.lock:
+            groups = self._authoritative_groups(groups, preview)
+            result = self._manage_categories_locked(actions, dry_run, groups)
+        if not dry_run: result["categories"] = self.category_catalog()
+        return result
+
+    def _manage_categories_locked(self, actions: list[dict[str, Any]], dry_run: bool, groups) -> dict[str, Any]:
+        if type(dry_run) is not bool:
+            raise ValueError("dry_run must be a boolean")
         if not isinstance(actions, list) or not 1 <= len(actions) <= 30:
             raise ValueError("actions must contain 1..30 category changes")
-        groups = self.scan()
         known = {item.id for item in all_categories(self.store)}
         custom = {item["id"] for item in self.store.data.get("custom_blocks", [])}
         prepared: list[dict[str, Any]] = []
         for action in actions:
+            if not isinstance(action, dict) or set(action) - {"action", "category", "title", "color"}:
+                raise ValueError("invalid category action fields")
+            if any(not isinstance(value, str) for value in action.values()):
+                raise ValueError("category action fields must be strings")
             kind = action.get("action") if isinstance(action, dict) else None
             if kind == "create":
                 title = re.sub(r"\s+", " ", str(action.get("title", ""))).strip()
@@ -945,7 +1113,7 @@ class OrganizerModel:
                         profile.get("panel_positions", {}).pop(identifier, None)
                         profile.get("panel_sizes", {}).pop(identifier, None)
             self.store.save()
-        return {"ok": True, "dry_run": False, "changes": prepared, "categories": self.category_catalog()}
+        return {"ok": True, "dry_run": False, "changes": prepared}
 
     @classmethod
     def config_purpose(cls, path: Path) -> str | None:
@@ -1049,7 +1217,8 @@ class ControlService:
         @self.app.post("/organize-batch")
         def organize_batch(payload: dict[str, Any]):
             try:
-                result = self.model.organize_items(payload.get("operations", []), bool(payload.get("dry_run", False)))
+                result = self.model.organize_items(payload.get("operations", []), payload.get("dry_run", False),
+                                                   allow_manual=payload.get("allow_manual", False))
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
             if not result["dry_run"]:
@@ -1063,7 +1232,7 @@ class ControlService:
         @self.app.post("/categories")
         def categories(payload: dict[str, Any]):
             try:
-                result = self.model.manage_categories(payload.get("actions", []), bool(payload.get("dry_run", False)))
+                result = self.model.manage_categories(payload.get("actions", []), payload.get("dry_run", False))
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
             if not result["dry_run"]:
@@ -1322,7 +1491,7 @@ class DesktopShell:
         self._ensure_guard()
 
     def retry_icon_attributes(self) -> None:
-        if getattr(self, 'attribute_errors', None):
+        if self.host and getattr(self, 'attribute_errors', None):
             self.hide_icons(self.organized_native_paths)
 
     def restore_icons(self) -> None:
@@ -1406,33 +1575,74 @@ class DesktopShell:
         # title bar to drag it promotes the popup above the user's editor or
         # browser until the next maintenance tick.
         ex_style = self.user32.GetWindowLongW(outer_window, -20) & 0xFFFFFFFF
-        no_activate_style = ex_style | 0x08000000  # WS_EX_NOACTIVATE
+        if ex_style & 0x00000008:
+            self.user32.SetWindowPos(outer_window, -2, 0, 0, 0, 0, 0x0003 | 0x0010 | 0x0200)
+        no_activate_style = (ex_style | 0x08000000) & ~0x00000008  # NOACTIVATE, never TOPMOST
         if no_activate_style >= 0x80000000: no_activate_style -= 0x100000000
         self.user32.SetWindowLongW(outer_window, -20, no_activate_style)
         # `-alpha` intentionally leaves WS_EX_LAYERED on.  Unlike a layered
         # child of DefView, this popup is composed by DWM and remains truly
         # translucent.  Insert directly above the desktop owner's z-band.
         self.user32.SetWindowPos(outer_window, desktop_owner, 0, 0, 0, 0, 0x0003 | 0x0010 | 0x0020 | 0x0200)
-        if self.user32.GetWindow(outer_window, 4) != desktop_owner: return False  # GW_OWNER
+        if self.user32.GetWindow(outer_window, 4) != desktop_owner:
+            logger.error("desktop.attach failed hwnd=%s owner=%s expected=%s", outer_window,
+                         self.user32.GetWindow(outer_window, 4), desktop_owner)
+            return False  # GW_OWNER
         self.panel_windows[window_id] = outer_window
+        logger.debug("desktop.attach hwnd=%s host=%s owner=%s", outer_window, self.host, desktop_owner)
         return True
 
-    def keep_panels_above_desktop_backdrop(self) -> None:
-        """Keep embedded panels above a live-wallpaper compositor, not apps.
+    def keep_panels_above_desktop_backdrop(self) -> bool:
+        """Repair Explorer ownership and visibility without rebuilding item widgets.
 
-        Some wallpaper managers add a full-screen ATL child to DefView after
-        our panels are created.  It silently takes the first sibling Z-order
-        slot and covers every panel while the organizer process remains alive.
-        Move only that desktop-local compositor below the panels, then restore
-        the panels' sibling order.  All windows remain DefView children, so
-        normal application windows are still above the organizer.
+        Explorer may replace DefView while the machine is idle. A stale owner
+        can leave a live popup invisible (or detached above other applications).
+        Re-discover the host and repair only affected windows on each tick.
         """
-        if not self.host or not self.panel_windows: return
+        previous_host = self.host
+        self.host = self._find_overlay_host()
+        changed = previous_host != self.host
+        if changed:
+            logger.warning("desktop.host changed old=%s current=%s panels=%s", previous_host,
+                           self.host, len(self.panel_windows))
+        if not self.host:
+            for window in self.panel_windows.values():
+                if self.user32.IsWindow(window): self.user32.ShowWindow(window, self.SW_HIDE)
+            if previous_host: self.restore_icons()
+            return changed
+        if not self.panel_windows: return changed
         desktop_owner = self.user32.GetAncestor(self.host, 2) or self.host
-        if not desktop_owner: return
+        if not desktop_owner: return changed
         flags = 0x0003 | 0x0010 | 0x0200  # no move/size/activate/owner-z-order
-        for window in self.panel_windows.values():
+        for window_id, window in list(self.panel_windows.items()):
+            if not self.user32.IsWindow(window):
+                logger.warning("desktop.window invalid hwnd=%s", window)
+                self.panel_windows.pop(window_id, None)
+                self.restore_icons()
+                changed = True
+                continue
+            if changed or self.user32.GetWindow(window, 4) != desktop_owner:
+                logger.warning("desktop.owner repair hwnd=%s owner=%s expected=%s", window,
+                               self.user32.GetWindow(window, 4), desktop_owner)
+                if not self.attach(window_id):
+                    self.user32.ShowWindow(window, self.SW_HIDE)
+                    self.restore_icons()
+                    continue
+                changed = True
+            ex_style = self.user32.GetWindowLongW(window, -20) & 0xFFFFFFFF
+            if not ex_style & 0x08000000:
+                logger.warning("desktop.noactivate restored hwnd=%s", window)
+                style = ex_style | 0x08000000
+                self.user32.SetWindowLongW(window, -20, style if style < 0x80000000 else style - 0x100000000)
+            if ex_style & 0x00000008:  # WS_EX_TOPMOST survives some native drag loops
+                logger.warning("desktop.topmost cleared hwnd=%s", window)
+                self.user32.SetWindowPos(window, -2, 0, 0, 0, 0, flags)  # HWND_NOTOPMOST
+            if not self.user32.IsWindowVisible(window):
+                logger.warning("desktop.visibility restored hwnd=%s", window)
+                self.user32.ShowWindow(window, 4)  # SW_SHOWNOACTIVATE
+                changed = True
             self.user32.SetWindowPos(window, desktop_owner, 0, 0, 0, 0, flags)
+        return changed
 
     def panel_is_desktop_child(self, window_id: int) -> bool:
         outer_window = self.panel_windows.get(window_id)
@@ -1596,7 +1806,12 @@ class OrganizerUI:
         # This is geometry/Z-order only; it neither recreates cards nor causes
         # hover/layout redraws.  It covers wallpaper managers that reassert
         # their DefView child after the organizer has started.
-        self.shell.keep_panels_above_desktop_backdrop()
+        desktop_recovered = self.shell.keep_panels_above_desktop_backdrop()
+        if desktop_recovered and self.shell.host:
+            if not self.panels: self.render()
+            elif all(self.shell.panel_is_desktop_child(panel.winfo_id()) and
+                     self.shell.panel_is_visible(panel.winfo_id()) for panel in self.panels.values()):
+                self.shell.hide_icons(self.organized_paths(self.model.scan()))
         rerender = False
         arrange_requested = False
         display_recovery = False
@@ -1618,6 +1833,9 @@ class OrganizerUI:
                 changed_categories.update(event.get("categories", [])); continue
             rerender = rerender or event.get("type") == "render"
         ui = self.model.store.data["ui"]
+        if not self.shell.host:
+            self.root.after(1200, self.tick)
+            return
         monitor_changed = self.shell.reconcile_target_monitor(ui)
         if monitor_changed:
             self.model.store.save()
@@ -1651,7 +1869,7 @@ class OrganizerUI:
 
     @staticmethod
     def snapshot_groups(groups: dict[str, list[dict[str, Any]]]) -> dict[str, tuple[tuple[str, str, bool], ...]]:
-        return {category: tuple((item["name"], item["modified"], bool(item.get("manual"))) for item in items)
+        return {category: tuple((item["name"], item.get("revision", item["modified"]), bool(item.get("manual"))) for item in items)
                 for category, items in groups.items()}
 
     @staticmethod
@@ -1864,7 +2082,7 @@ class OrganizerUI:
             # feed it into the legacy dynamic packer, which can have no valid
             # state after a remote desktop shrinks below an old layout.
             packed = ({item.key: item for item in requested} if profile.get("auto_layout", True)
-                      else pack_rectangles(requested, bounds, margin=12, gap=10))
+                      else restore_rectangles(requested, bounds, margin=12))
             changed = False
             for category, panel in self.panels.items():
                 rect = packed[category]
@@ -2242,16 +2460,7 @@ class OrganizerUI:
             return
         # Remove stale per-item presentation data now; the next scan removes
         # the item from its block and restores the native desktop if needed.
-        key = item["name"].casefold()
-        data = self.model.store.data
-        data.get("overrides", {}).pop(key, None)
-        data.get("pending_inbox", {}).pop(key, None)
-        data.get("seen", {}).pop(key, None)
-        data.get("visual_assets", {}).pop(key, None)
-        data.get("tip_summaries", {}).pop(key, None)
-        for names in data.get("item_orders", {}).values():
-            if isinstance(names, list): names[:] = [name for name in names if name.casefold() != key]
-        self.model.store.save()
+        self.model.forget_item_state(item["name"])
         self.render()
 
     def open_location(self, path: str) -> None:
@@ -2753,7 +2962,7 @@ class OrganizerUI:
         monitor = self.shell.target_monitor(self.model.store.data["ui"].get("target_monitor", "primary")); margin = 12
         x = max(monitor["left"] + margin, min(x, monitor["right"] - panel.winfo_width() - margin))
         y = max(monitor["top"] + margin, min(y, monitor["bottom"] - panel.winfo_height() - margin))
-        panel.geometry(f"{geometry}+{x}+{y}")
+        panel.geometry(f"{geometry}{x:+d}{y:+d}")
         # Geometry updates during a pressed drag can reorder an owned popup on
         # some Windows/RDP builds.  Keep this synchronous rather than waiting
         # for the 1.2s maintenance tick, so it never covers another app.
@@ -2765,10 +2974,17 @@ class OrganizerUI:
         panel = self.panels.get(category)
         if not panel: return
         self.root.update_idletasks()
+        candidate = Rect(category, panel.winfo_x(), panel.winfo_y(), panel.winfo_width(), panel.winfo_height())
+        occupied = [Rect(name, item.winfo_x(), item.winfo_y(), item.winfo_width(), item.winfo_height())
+                    for name, item in self.panels.items() if name != category]
+        if not can_place_rectangle(candidate, occupied):
+            logger.info("layout.drag rejected category=%s candidate=%s", category, candidate)
+            panel.geometry(f"{candidate.width}x{candidate.height}{self.drag_panel_x:+d}{self.drag_panel_y:+d}")
+            self.shell.keep_panels_above_desktop_backdrop()
+            return
         self.active_profile["auto_layout"] = False
-        self.active_profile.setdefault("panel_positions", {})[category] = f"+{panel.winfo_x()}+{panel.winfo_y()}"
+        self.active_profile.setdefault("panel_positions", {})[category] = f"{panel.winfo_x():+d}{panel.winfo_y():+d}"
         self.active_profile.setdefault("panel_sizes", {})[category] = {"width": panel.winfo_width(), "height": panel.winfo_height()}
-        self.resolve_geometry_conflicts(category)
         self.model.store.save()
         self.shell.keep_panels_above_desktop_backdrop()
 
@@ -2819,10 +3035,17 @@ class OrganizerUI:
         category = state["category"]; panel = self.panels.get(category)
         if not panel: return
         self.root.update_idletasks()
+        candidate = Rect(category, panel.winfo_x(), panel.winfo_y(), panel.winfo_width(), panel.winfo_height())
+        occupied = [Rect(name, item.winfo_x(), item.winfo_y(), item.winfo_width(), item.winfo_height())
+                    for name, item in self.panels.items() if name != category]
+        if not can_place_rectangle(candidate, occupied):
+            logger.info("layout.resize rejected category=%s candidate=%s", category, candidate)
+            panel.geometry(f"{state['width']}x{state['height']}{state['x']:+d}{state['y']:+d}")
+            self.shell.keep_panels_above_desktop_backdrop()
+            return
         self.active_profile["auto_layout"] = False
         self.active_profile.setdefault("panel_positions", {})[category] = f"+{panel.winfo_x()}+{panel.winfo_y()}"
         self.active_profile.setdefault("panel_sizes", {})[category] = {"width": panel.winfo_width(), "height": panel.winfo_height()}
-        self.resolve_geometry_conflicts(category)
         self.model.store.save()
         self.shell.keep_panels_above_desktop_backdrop()
 
@@ -2860,7 +3083,9 @@ class OrganizerUI:
 
 def main() -> None:
     parser = argparse.ArgumentParser(); parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--log-level", choices=("debug", "info", "warn", "error"))
     args = parser.parse_args()
+    configure_logging(args.log_level, role="overlay")
     if not args.headless:
         enable_per_monitor_dpi_awareness()
     # The overlay is occasionally launched directly by legacy shortcuts or
@@ -2874,7 +3099,7 @@ def main() -> None:
         else:
             manager_script = Path(__file__).with_name("deskflow_manager.py")
             gui_executable = Path(sys.executable).with_name("pythonw.exe")
-            subprocess.Popen(command("manager", "--start"), cwd=APP_ROOT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            subprocess.Popen(command("manager", "--start", *logging_arguments()), cwd=APP_ROOT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             return
     # The BAT may be double-clicked repeatedly.  Only the visible overlay owns
     # this mutex; headless inspection/service commands remain independently

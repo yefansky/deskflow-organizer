@@ -14,11 +14,13 @@ import os
 import queue
 import re
 import subprocess
+import threading
+from time import perf_counter
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QFileInfo, QPoint, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QCursor, QFont, QIcon, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QFileInfo, QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QCursor, QFont, QIcon, QImage, QPixmap, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -49,7 +51,10 @@ from PySide6.QtWidgets import (
 from shiboken6 import isValid
 from win32com.shell import shell, shellcon
 
-from layout_engine import Rect, overlaps, pack_rectangles
+from layout_engine import Rect, overlaps, pack_rectangles, can_place_rectangle, restore_rectangles
+from diagnostics import get_logger, traced, timed_operation
+
+logger = get_logger(__name__)
 
 
 PANEL_MODES = ("list", "compact", "cards")
@@ -109,6 +114,9 @@ class HeaderBar(QWidget):
                 wanted.x(), wanted.y(), self.panel.width(), self.panel.height()
             )
             self.panel.move(x, y)
+            candidate = Rect(self.panel.category.id, x, y, self.panel.width(), self.panel.height())
+            self.setCursor(Qt.CursorShape.SizeAllCursor if self.panel.controller.can_place_panel(candidate)
+                           else Qt.CursorShape.ForbiddenCursor)
             self.panel.controller.shell.keep_panels_above_desktop_backdrop()
             event.accept()
             return
@@ -116,11 +124,43 @@ class HeaderBar(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         if self._start_global is not None:
+            original = self._start_panel
             self._start_global = self._start_panel = None
-            self.panel.controller.finish_panel_geometry(self.panel.category.id)
+            self.panel.controller.finish_panel_geometry(self.panel.category.id, original)
+            self.unsetCursor()
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+
+class HeaderButton(QToolButton):
+    """Explain desktop header actions in the same composition layer after 2s."""
+
+    def __init__(self, panel: "PanelWindow", text: str) -> None:
+        super().__init__(panel.header)
+        self.panel, self.help_text = panel, text
+        self.help_timer = QTimer(self)
+        self.help_timer.setSingleShot(True)
+        self.help_timer.setInterval(2000)
+        self.help_timer.timeout.connect(self.show_help)
+
+    def show_help(self) -> None:
+        if self.underMouse(): self.panel.tip_bubble.show_for(self, self.help_text)
+
+    def enterEvent(self, event) -> None:
+        self.panel.hide_item_tip()
+        self.help_timer.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self.help_timer.stop()
+        self.panel.tip_bubble.hide()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        self.help_timer.stop()
+        self.panel.tip_bubble.hide()
+        super().mousePressEvent(event)
 
 
 class TipBubble(QFrame):
@@ -149,16 +189,31 @@ class TipBubble(QFrame):
         if not text.strip() or not anchor.isVisible():
             self.hide()
             return
-        width = max(150, min(360, self.panel.width() - 18))
-        self.label.setFixedWidth(max(120, width - 18))
+        anchor_pos = anchor.mapTo(self.panel, QPoint(0, 0))
+        icon = getattr(anchor, "icon_label", None)
+        inset = (icon.mapTo(self.panel, QPoint(0, 0)).x() + icon.width() + 16
+                 if icon is not None else anchor_pos.x() + 24)
+        x = max(8, min(inset, self.panel.width() - 128))
+        width = max(120, min(360, self.panel.width() - x - 8))
+        self.label.setFixedWidth(max(102, width - 18))
         self.label.setText(text)
         self.label.adjustSize()
         self.adjustSize()
-        anchor_pos = anchor.mapTo(self.panel, QPoint(0, 0))
-        x = max(8, min(anchor_pos.x() + 6, self.panel.width() - self.width() - 8))
-        below = anchor_pos.y() + anchor.height() + 4
-        y = below if below + self.height() <= self.panel.height() - 8 else anchor_pos.y() - self.height() - 4
-        y = max(8, min(y, self.panel.height() - self.height() - 8))
+        x = max(8, min(x, self.panel.width() - self.width() - 8))
+        # Prefer the area above the hovered row, so the next icon stays visible.
+        above = anchor_pos.y() - self.height() - 12
+        below = anchor_pos.y() + anchor.height() + 12
+        occupied = [QRect(item.mapTo(self.panel, QPoint(0, 0)), item.size())
+                    for item in self.panel.item_widgets if item.isVisible()]
+        content_bottom = max((rect.bottom() for rect in occupied), default=35)
+        candidates = (content_bottom + 12, self.panel.height() - self.height() - 8, above, below)
+        y = next((candidate for candidate in candidates
+                  if candidate >= 8 and candidate + self.height() <= self.panel.height() - 8
+                  and not any(QRect(x, candidate, self.width(), self.height()).intersects(rect)
+                              for rect in occupied)), None)
+        if y is None:
+            y = above if above >= 8 else below
+            y = max(8, min(y, self.panel.height() - self.height() - 8))
         self.move(x, y)
         self.raise_()
         self.show()
@@ -215,8 +270,16 @@ class ItemWidget(QWidget):
             _with_shadow(text)
             layout.addWidget(text, 1)
 
-        tip = panel.controller.item_tip(item)
-        if mode == "cards":
+        self.icon_label, self.icon_size = icon_label, icon_size
+        self.name_label = text if mode != "cards" else None
+        self.update_item(item)
+
+    def update_item(self, item: dict[str, Any]) -> None:
+        self.item = dict(item)
+        if self.name_label is not None:
+            self.name_label.setText(Path(item["name"]).stem if item["kind"] != "folder" else item["name"])
+        tip = self.panel.controller.item_tip(item)
+        if self.mode == "cards":
             display_name = Path(item["name"]).stem if item["kind"] != "folder" else item["name"]
             tip = display_name if tip == item["name"] else f"{display_name}\n{tip}"
         # Qt's native tooltip is a separate top-level window.  DESKFLOW panels
@@ -267,6 +330,10 @@ class ItemWidget(QWidget):
             point = event.globalPosition().toPoint()
             if (point - self._press_global).manhattanLength() > 8:
                 self._moved = True
+                self.panel.hide_item_tip()
+                target = self.panel.controller.panel_at(point)
+                self.setCursor(Qt.CursorShape.ClosedHandCursor if target == self.panel.category.id
+                               else Qt.CursorShape.DragMoveCursor)
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -277,6 +344,7 @@ class ItemWidget(QWidget):
             moved = self._moved
             self._press_global = None
             self._moved = False
+            self.unsetCursor()
             if moved:
                 self.panel.controller.drop_item(self, destination)
             else:
@@ -368,9 +436,8 @@ class PanelWindow(QWidget):
             ("×", "关闭并恢复原生桌面", controller.close),
         )
         for glyph, tooltip, callback in actions:
-            button = QToolButton(self.header)
+            button = HeaderButton(self, tooltip)
             button.setText(glyph)
-            button.setToolTip(tooltip)
             button.setFixedSize(22, 22)
             color = "#ff9caf" if glyph == "×" else "#f4f8ff"
             button.setStyleSheet(
@@ -473,12 +540,47 @@ class PanelWindow(QWidget):
         QTimer.singleShot(0, restore_scroll)
         return True
 
+    def reconcile_items(self, items: list[dict[str, Any]]) -> None:
+        """Apply a path-keyed delta; preserve surviving widgets, selection and scroll."""
+        key = lambda item: os.path.normcase(os.path.abspath(item["path"]))
+        existing = {key(widget.item): widget for widget in self.item_widgets}
+        old_order = list(existing)
+        scroll = self.scroll.verticalScrollBar()
+        previous_scroll = scroll.value()
+        survivors = []
+        added = updated = 0
+        for item in items:
+            widget = existing.pop(key(item), None)
+            if widget is None:
+                widget = ItemWidget(self, item, self.mode)
+                added += 1
+            elif widget.item != item or widget.tip_text != self.controller.item_tip(item):
+                if widget.item.get("revision", widget.item.get("modified")) != item.get("revision", item.get("modified")):
+                    self.controller.invalidate_icon(item["path"])
+                    widget.icon_label.setPixmap(self.controller.icon_for(item["path"], widget.icon_size).pixmap(widget.icon_size, widget.icon_size))
+                widget.update_item(item)
+                updated += 1
+            survivors.append(widget)
+        for widget in existing.values():
+            if self.controller.selected_item is widget:
+                self.controller.clear_selection()
+            self.hide_item_tip(widget)
+            self.grid.removeWidget(widget)
+            widget.hide()
+            widget.deleteLater()
+        self.items = list(items)
+        self.item_widgets = survivors
+        if old_order != [key(item) for item in items]:
+            self._reflow_items()
+            QTimer.singleShot(0, lambda: scroll.setValue(min(previous_scroll, scroll.maximum())) if isValid(scroll) else None)
+        logger.debug("panel.delta category=%s added=%s removed=%s updated=%s retained=%s", self.category.id, added, len(existing), updated, len(survivors) - added)
+
     def schedule_item_tip(self, item: ItemWidget) -> None:
         self._tip_generation += 1
         generation = self._tip_generation
 
         def show() -> None:
-            if generation == self._tip_generation and item.hovered and item.isVisible():
+            if generation == self._tip_generation and isValid(item) and item.hovered and item.isVisible():
                 self.tip_bubble.show_for(item, item.tip_text)
 
         QTimer.singleShot(360, show)
@@ -541,13 +643,16 @@ class PanelWindow(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             edges = self._resize_edges(event.position().toPoint())
             handle = self.windowHandle()
+            if edges and handle:
+                self._resize_original = self.geometry()
             if edges and handle and handle.startSystemResize(edges):
                 event.accept()
                 return
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
-        self.controller.finish_panel_geometry(self.category.id)
+        self.controller.finish_panel_geometry(self.category.id, getattr(self, "_resize_original", None))
+        self._resize_original = None
         super().mouseReleaseEvent(event)
 
 
@@ -574,6 +679,16 @@ class QtOrganizerUI:
         self.native_drag: dict[str, Any] | None = None
         self.icon_provider = QFileIconProvider()
         self.icon_cache: dict[tuple[str, int], QIcon] = {}
+        self._groups: dict[str, list[dict[str, Any]]] | None = None
+        self._icon_requests: queue.Queue = queue.Queue()
+        self._icon_results: queue.Queue = queue.Queue()
+        self._icon_pending: dict[tuple[str, int], int] = {}
+        self._icon_versions: dict[str, int] = {}
+        self._icon_stop = threading.Event()
+        threading.Thread(target=self._load_icons, name="deskflow-icons", daemon=True).start()
+        self.icon_timer = QTimer()
+        self.icon_timer.timeout.connect(self._apply_icons)
+        self.icon_timer.start(30)
         self._settings_dialog: QDialog | None = None
         # While the settings dialog is open, configuration may be changed in
         # memory to render a live preview.  It must never be written until
@@ -620,11 +735,79 @@ class QtOrganizerUI:
     def icon_for(self, path: str, size: int) -> QIcon:
         key = (path, size)
         if key not in self.icon_cache:
-            icon = self.shell_icon(path)
-            if icon.isNull():
-                icon = self.app.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
-            self.icon_cache[key] = icon
+            self.icon_cache[key] = self.app.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+            version = self._icon_versions.get(path, 0)
+            self._icon_pending[key] = version
+            self._icon_requests.put((key, version, perf_counter()))
+            logger.debug("icon.queued pending=%s", len(self._icon_pending))
         return self.icon_cache[key]
+
+    def invalidate_icon(self, path: str) -> None:
+        self._icon_versions[path] = self._icon_versions.get(path, 0) + 1
+        for key in list(self.icon_cache):
+            if key[0] == path:
+                self.icon_cache.pop(key, None)
+
+    def _load_icons(self) -> None:
+        # Only detached QImages cross the worker boundary. QPixmap, widgets and
+        # the model/Store remain exclusively on the UI thread.
+        import pythoncom
+        import win32gui
+        pythoncom.CoInitialize()
+        try:
+            while not self._icon_stop.is_set():
+                try:
+                    key, version, queued = self._icon_requests.get(timeout=.2)
+                except queue.Empty:
+                    continue
+                handle = None
+                image = QImage()
+                try:
+                    with timed_operation("icon.shell_lookup"):
+                        path, _size = key
+                        source, index = self.url_icon_source(path) if Path(path).suffix.lower() == ".url" else (None, 0)
+                        if source:
+                            source = os.path.expandvars(source)
+                            image = QImage(source)
+                            if image.isNull():
+                                import win32gui as gui
+                                large, small = gui.ExtractIconEx(source, index, 1)
+                                handle = large[0] if large else small[0] if small else None
+                                for extra in small if large else []:
+                                    gui.DestroyIcon(extra)
+                        if image.isNull() and handle is None:
+                            handle = shell.SHGetFileInfo(path, 0, shellcon.SHGFI_ICON | shellcon.SHGFI_LARGEICON)[1][0]
+                        if image.isNull() and handle:
+                            image = QImage.fromHICON(handle).copy()
+                except Exception:
+                    logger.exception("icon.shell_lookup.failed")
+                finally:
+                    if handle:
+                        win32gui.DestroyIcon(handle)
+                self._icon_results.put((key, version, image, queued))
+        finally:
+            pythoncom.CoUninitialize()
+
+    def _apply_icons(self) -> None:
+        # Bound each UI delivery so a large desktop cannot starve input events.
+        for _ in range(12):
+            try:
+                key, version, image, queued = self._icon_results.get_nowait()
+            except queue.Empty:
+                break
+            if version != self._icon_versions.get(key[0], 0):
+                logger.debug("icon.discard_stale")
+                continue
+            self._icon_pending.pop(key, None)
+            if image.isNull():
+                continue
+            icon = QIcon(QPixmap.fromImage(image))
+            self.icon_cache[key] = icon
+            for panel in self.panels.values():
+                for widget in panel.item_widgets:
+                    if widget.item["path"] == key[0] and widget.icon_size == key[1]:
+                        widget.icon_label.setPixmap(icon.pixmap(key[1], key[1]))
+            logger.debug("icon.delivered queue_ms=%.3f", (perf_counter() - queued) * 1000)
 
     def shell_icon(self, path: str) -> QIcon:
         """Resolve the visible icon for any desktop entry.
@@ -695,7 +878,7 @@ class QtOrganizerUI:
     @staticmethod
     def snapshot_groups(groups: dict[str, list[dict[str, Any]]]) -> dict[str, tuple[tuple[str, str, bool], ...]]:
         return {
-            category: tuple((item["name"], item["modified"], bool(item.get("manual"))) for item in items)
+            category: tuple((item["name"], item.get("revision", item["modified"]), bool(item.get("manual"))) for item in items)
             for category, items in groups.items()
         }
 
@@ -718,23 +901,11 @@ class QtOrganizerUI:
             values.append(int(raw.replace("+-", "-").replace("--", "+")))
         return values[0], values[1]
 
-    def render(self, only: str | None = None) -> None:
+    @traced("ui.render")
+    def render(self, only: str | None = None, groups: dict[str, list[dict[str, Any]]] | None = None) -> None:
         # Rebuilding a panel invalidates all of its ItemWidget wrappers.  Never
         # retain a selection reference across that boundary: a later right
         # click would otherwise call update() on an already deleted C++ object.
-        self.clear_selection()
-        if only is None:
-            for panel in self.panels.values():
-                self.shell.panel_windows.pop(int(panel.winId()), None)
-                panel.close()
-                panel.deleteLater()
-            self.panels = {}
-        elif only in self.panels:
-            previous = self.panels.pop(only)
-            self.shell.panel_windows.pop(int(previous.winId()), None)
-            previous.close()
-            previous.deleteLater()
-
         self.shell.host = self.shell._find_overlay_host()
         if not self.shell.host:
             self._destroy_all()
@@ -742,15 +913,31 @@ class QtOrganizerUI:
             return
         ui = self.model.store.data["ui"]
         monitor = self.shell.target_monitor(ui.get("target_monitor", "primary"))
-        self.last_work_bounds = (monitor["left"], monitor["top"], monitor["right"], monitor["bottom"])
-        groups = self.model.scan()
+        current_bounds = (monitor["left"], monitor["top"], monitor["right"], monitor["bottom"])
+        display_changed = self.last_work_bounds is not None and self.last_work_bounds != current_bounds
+        self.last_work_bounds = current_bounds
+        if groups is None:
+            groups = self._groups if self._settings_preview and self._groups is not None else self.model.scan()
+        self._groups = groups
         self.group_snapshot = self.snapshot_groups(groups)
         automatic = self.auto_layout(groups, monitor)
         profile = self.layout_profile(monitor)
         use_automatic_layout = profile.get("auto_layout", True)
         attached: list[bool] = []
+        structural_change = False
+        hidden_empty = set(ui.get("hidden_empty_categories", []))
+        category_ids = {category.id for category in self.categories() if category.id != "inbox"
+                        and (category.id not in hidden_empty or groups.get(category.id))}
+        for removed in set(self.panels) - category_ids:
+            structural_change = True
+            previous = self.panels.pop(removed)
+            if self.selected_item in previous.item_widgets:
+                self.clear_selection()
+            self.shell.panel_windows.pop(int(previous.winId()), None)
+            previous.close()
+            previous.deleteLater()
         for category in self.categories():
-            if category.id == "inbox" or (only is not None and category.id != only):
+            if category.id not in category_ids or (only is not None and category.id != only):
                 continue
             items = self.model.sorted_items(category.id, groups.get(category.id, []))
             mode = self.model.store.data.get("category_modes", {}).get(category.id, category.mode)
@@ -760,7 +947,29 @@ class QtOrganizerUI:
             base = style.get("background", ui.get("background", "#101827"))
             panel_background = self.tint(base, category.color, .045)
             opacity = float(style.get("alpha", ui.get("alpha", .22)))
+            appearance = (mode, self.cell_size(), self.font_size(), panel_background,
+                          ui.get("category_names", {}).get(category.id, category.title))
+            previous = self.panels.get(category.id)
+            if previous is not None and getattr(previous, "_appearance", None) == appearance:
+                previous.set_plate_opacity(opacity)
+                previous.reconcile_items(items)
+                if display_changed:
+                    x, y, width, height = automatic[category.id]
+                    if not use_automatic_layout:
+                        size = profile.get("panel_sizes", {}).get(category.id, {})
+                        width, height = int(size.get("width", width)), int(size.get("height", height))
+                        x, y = self._position_from_saved(profile.get("panel_positions", {}).get(category.id, ""), (x, y))
+                    previous.setGeometry(x, y, width, height)
+                continue
+            if previous is not None:
+                if self.selected_item in previous.item_widgets:
+                    self.clear_selection()
+                self.shell.panel_windows.pop(int(previous.winId()), None)
+                previous.close()
+                previous.deleteLater()
             panel = PanelWindow(self, category, items, mode, panel_background, opacity)
+            structural_change = True
+            panel._appearance = appearance
             x, y, width, height = automatic[category.id]
             if not use_automatic_layout:
                 saved_size = profile.get("panel_sizes", {}).get(category.id, {})
@@ -771,7 +980,6 @@ class QtOrganizerUI:
                 )
             panel.setGeometry(x, y, width, height)
             panel.show()
-            self.app.processEvents()
             attached.append(self.shell.attach(int(panel.winId())))
             self.panels[category.id] = panel
 
@@ -782,8 +990,7 @@ class QtOrganizerUI:
             self.shell.restore_icons()
             return
         self.shell.keep_panels_above_desktop_backdrop()
-        self.app.processEvents()
-        if only is None:
+        if only is None and (structural_change or display_changed):
             bounds = (monitor["left"], monitor["top"], monitor["right"], monitor["bottom"])
             requested = [
                 Rect(category, panel.x(), panel.y(), panel.width(), panel.height())
@@ -792,11 +999,20 @@ class QtOrganizerUI:
             packed = (
                 {item.key: item for item in requested}
                 if use_automatic_layout
-                else pack_rectangles(requested, bounds, margin=12, gap=10)
+                else restore_rectangles(requested, bounds, margin=8)
             )
             for category, panel in self.panels.items():
                 rect = packed[category]
-                panel.setGeometry(rect.x, rect.y, rect.width, rect.height)
+                if (panel.x(), panel.y(), panel.width(), panel.height()) != (rect.x, rect.y, rect.width, rect.height):
+                    panel.setGeometry(rect.x, rect.y, rect.width, rect.height)
+            if not use_automatic_layout and not self._settings_preview:
+                corrected = any(rect != requested[index] for index, rect in enumerate(packed.values()))
+                if corrected:
+                    logger.warning("layout.saved_profile repaired bounds=%s", bounds)
+                    for category, rect in packed.items():
+                        profile.setdefault("panel_positions", {})[category] = f"+{rect.x}+{rect.y}"
+                        profile.setdefault("panel_sizes", {})[category] = {"width": rect.width, "height": rect.height}
+                    self.model.store.save()
         if self.panels and all(
             self.shell.panel_is_visible(int(panel.winId())) for panel in self.panels.values()
         ):
@@ -811,8 +1027,22 @@ class QtOrganizerUI:
             panel.deleteLater()
         self.panels = {}
 
+    @traced("ui.tick")
     def tick(self) -> None:
-        self.shell.keep_panels_above_desktop_backdrop()
+        desktop_recovered = self.shell.keep_panels_above_desktop_backdrop()
+        if desktop_recovered and self.shell.host:
+            invalid = [category for category, panel in self.panels.items()
+                       if int(panel.winId()) not in self.shell.panel_windows]
+            for category in invalid:
+                logger.warning("desktop.recovery replace_invalid_window category=%s", category)
+                self.panels[category]._appearance = None
+                self.render(category)
+            if not self.panels:
+                logger.info("desktop.recovery rebuild_missing_panels")
+                self.render()
+            elif all(self.shell.panel_is_desktop_child(int(panel.winId())) and
+                     self.shell.panel_is_visible(int(panel.winId())) for panel in self.panels.values()):
+                self.shell.hide_icons(self.organized_paths(self._groups or {}))
         self.shell.retry_icon_attributes()
         rerender = False
         arrange = False
@@ -824,6 +1054,7 @@ class QtOrganizerUI:
             except queue.Empty:
                 break
             kind = event.get("type")
+            logger.debug("ui.event kind=%s remaining=%s", kind, self.events.qsize())
             if kind == "close":
                 self.close()
                 return
@@ -850,7 +1081,11 @@ class QtOrganizerUI:
             and self._settings_dialog.isVisible()
         )
         if settings_preview_open:
+            if changed or rerender:
+                self._deferred_content_refresh = True
             return
+        if not self.shell.host:
+            return  # Shell already restored native icons; do not hide them again.
         monitor_changed = self.shell.reconcile_target_monitor(ui)
         if monitor_changed:
             self.model.store.save()
@@ -860,8 +1095,11 @@ class QtOrganizerUI:
         if self.last_work_bounds is not None and bounds != self.last_work_bounds:
             arrange = recovery = True
         signature = self.model.desktop_signature()
+        scanned = False
         if signature != self.last_desktop_signature:
             groups = self.model.scan()
+            scanned = True
+            self._groups = groups
             snapshot = self.snapshot_groups(groups)
             changed.update(
                 category
@@ -872,16 +1110,24 @@ class QtOrganizerUI:
             self.group_snapshot = snapshot
             self.shell.hide_icons(self.organized_paths(groups))
         if arrange:
+            if recovery:
+                logger.warning("desktop.display_recovery rebuilding_windows bounds=%s", bounds)
+                self.clear_selection()
+                self._destroy_all()
             self.arrange_top_right(rebuild=rerender or recovery)
         elif rerender:
             self.render()
         else:
+            if changed and not scanned:
+                self._groups = self.model.scan()
             for category in changed:
                 if category != "inbox":
-                    self.render(category)
+                    self.render(category, groups=self._groups)
 
     def auto_layout(self, groups: dict[str, list[dict[str, Any]]], monitor: dict[str, Any]) -> dict[str, tuple[int, int, int, int]]:
-        categories = [category for category in self.categories() if category.id != "inbox"]
+        hidden = set(self.model.store.data["ui"].get("hidden_empty_categories", []))
+        categories = [category for category in self.categories() if category.id != "inbox"
+                      and (category.id not in hidden or groups.get(category.id))]
         gap, margin = 7, 10
         screen_width = monitor["right"] - monitor["left"]
         screen_height = monitor["bottom"] - monitor["top"]
@@ -980,7 +1226,7 @@ class QtOrganizerUI:
             self.render()
             if not self.panels:
                 return
-        automatic = self.auto_layout(self.model.scan(), monitor)
+        automatic = self.auto_layout(self._groups if getattr(self, "_groups", None) is not None else self.model.scan(), monitor)
         for category, panel in self.panels.items():
             x, y, width, height = automatic[category]
             panel.setGeometry(x, y, width, height)
@@ -1026,10 +1272,28 @@ class QtOrganizerUI:
         candidates.sort(key=lambda point: (point[0] - base_x) ** 2 + (point[1] - base_y) ** 2)
         return next(((x, y) for x, y in candidates if free(x, y)), (base_x, base_y))
 
-    def finish_panel_geometry(self, category: str) -> None:
+    def can_place_panel(self, candidate: Rect) -> bool:
+        if not can_place_rectangle(candidate, [Rect(name, panel.x(), panel.y(), panel.width(), panel.height())
+                                               for name, panel in self.panels.items()]):
+            return False
+        monitor = self.shell.target_monitor(self.model.store.data["ui"].get("target_monitor", "primary"))
+        return (candidate.width > 0 and candidate.height > 0
+                and candidate.x >= monitor["left"] + 8 and candidate.y >= monitor["top"] + 8
+                and candidate.x + candidate.width <= monitor["right"] - 8
+                and candidate.y + candidate.height <= monitor["bottom"] - 8)
+
+    def finish_panel_geometry(self, category: str, original: Any = None) -> bool:
         panel = self.panels.get(category)
         if not panel:
-            return
+            return False
+        candidate = Rect(category, panel.x(), panel.y(), panel.width(), panel.height())
+        if not self.can_place_panel(candidate):
+            if original is not None:
+                if isinstance(original, QPoint): panel.move(original)
+                else: panel.setGeometry(original)
+            logger.info("layout.placement rejected category=%s candidate=%s", category, candidate)
+            self.shell.keep_panels_above_desktop_backdrop()
+            return False
         profile = getattr(self, "active_profile", None)
         if profile is None:
             monitor = self.shell.target_monitor(self.model.store.data["ui"].get("target_monitor", "primary"))
@@ -1040,9 +1304,10 @@ class QtOrganizerUI:
             "width": panel.width(),
             "height": panel.height(),
         }
-        self.resolve_geometry_conflicts(category)
         self.model.store.save()
+        logger.info("layout.placement saved category=%s rect=%s", category, candidate)
         self.shell.keep_panels_above_desktop_backdrop()
+        return True
 
     def resolve_geometry_conflicts(self, anchor: str) -> None:
         for _ in range(max(1, len(self.panels) * 2)):
@@ -1074,9 +1339,10 @@ class QtOrganizerUI:
         panel = self.panels.get(category)
         if not panel:
             return
-        x, y = self.safe_position(category, x, y, panel.width(), panel.height())
+        original = panel.pos()
+        x, y = self.bound_position(x, y, panel.width(), panel.height())
         panel.move(x, y)
-        self.finish_panel_geometry(category)
+        self.finish_panel_geometry(category, original)
 
     def panel_at(self, point: QPoint) -> str | None:
         for category, panel in self.panels.items():
@@ -1113,7 +1379,7 @@ class QtOrganizerUI:
         self.shell.hide_icons(self.organized_paths(groups))
         for category in affected:
             if category != "inbox":
-                self.render(category)
+                self.render(category, groups=groups)
 
     def drop_item(self, widget: ItemWidget, point: QPoint) -> None:
         source = widget.panel.category.id
@@ -1292,14 +1558,7 @@ class QtOrganizerUI:
         except Exception as exc:
             QMessageBox.critical(None, "无法删除", f"无法将该项移到回收站：{exc}")
             return
-        key = item["name"].casefold()
-        data = self.model.store.data
-        for field in ("overrides", "pending_inbox", "seen", "visual_assets", "tip_summaries"):
-            data.get(field, {}).pop(key, None)
-        for names in data.get("item_orders", {}).values():
-            if isinstance(names, list):
-                names[:] = [name for name in names if name.casefold() != key]
-        self.model.store.save()
+        self.model.forget_item_state(item["name"])
         self.clear_selection()
         panel = self.panels.get(source)
         removed_in_place = bool(
@@ -1378,11 +1637,14 @@ class QtOrganizerUI:
                 f"屏幕 {index}（{width}×{height}）",
                 lambda checked=False, preference=target: self.choose_monitor_and_arrange(preference),
             )
-        custom_ids = {block["id"] for block in self.model.store.data.get("custom_blocks", [])}
-        if category in custom_ids and not self.model.scan().get(category, []):
+        if not (self._groups or {}).get(category, []):
             menu.addSeparator()
-            menu.addAction("删除空块", lambda: self.delete_empty_block(category))
-        menu.exec(point)
+            remove_action = menu.addAction("移除这个空整理块…")
+        else:
+            remove_action = None
+        chosen = menu.exec(point)
+        if remove_action is not None and chosen is remove_action:
+            QTimer.singleShot(0, lambda: self.delete_empty_block(category))
 
     def rename_category(self, category: str) -> None:
         current = next(
@@ -1411,18 +1673,56 @@ class QtOrganizerUI:
         self.model.store.save()
         self.arrange_top_right(rebuild=True)
 
+    @staticmethod
+    def confirm_empty_block(custom: bool) -> bool:
+        text = "删除这个空整理块？" if custom else "移除这个空整理块；有新内容时会重新显示。"
+        dialog = QMessageBox(QMessageBox.Icon.Question, "确认移除空整理块", text,
+                             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        dialog.button(QMessageBox.StandardButton.Yes).setText("删除" if custom else "移除")
+        dialog.button(QMessageBox.StandardButton.No).setText("取消")
+        dialog.setDefaultButton(QMessageBox.StandardButton.No)
+        return dialog.exec() == QMessageBox.StandardButton.Yes
+
     def delete_empty_block(self, category: str) -> None:
         if self.model.scan().get(category):
             return
-        self.model.store.data["custom_blocks"] = [
-            block for block in self.model.store.data.get("custom_blocks", []) if block["id"] != category
-        ]
-        self.model.store.data.get("category_modes", {}).pop(category, None)
-        ui = self.model.store.data["ui"]
-        ui.get("category_names", {}).pop(category, None)
-        ui.get("panel_styles", {}).pop(category, None)
-        self.model.store.save()
-        self.render()
+        custom_ids = {block["id"] for block in self.model.store.data.get("custom_blocks", [])}
+        custom = category in custom_ids
+        if not self.confirm_empty_block(custom):
+            return
+        self._remove_confirmed_empty_block(category, custom)
+
+    def _remove_confirmed_empty_block(self, category: str, custom: bool) -> None:
+        # Scan outside the shared Store lock: Shell/shortcut IO can be slow.
+        # A new manual assignment may race that snapshot. Recheck its latest
+        # mapping under the short mutation lock before removing the category.
+        populated = bool(self.model.scan().get(category))
+        with self.model.store.lock:
+            populated = populated or any(target == category for target in
+                                         self.model.store.data.get("overrides", {}).values())
+            if not populated:
+                ui = self.model.store.data["ui"]
+                if not custom:
+                    ui["hidden_empty_categories"] = sorted(set(ui.get("hidden_empty_categories", [])) | {category})
+                else:
+                    self.model.store.data["custom_blocks"] = [
+                        block for block in self.model.store.data.get("custom_blocks", []) if block["id"] != category
+                    ]
+                    self.model.store.data.get("category_modes", {}).pop(category, None)
+                    ui.get("category_names", {}).pop(category, None)
+                    ui.get("panel_styles", {}).pop(category, None)
+                    self.model.store.data.get("category_sorting", {}).pop(category, None)
+                    self.model.store.data.get("item_orders", {}).pop(category, None)
+                    for profile in ui.get("layout_profiles", {}).values():
+                        profile.get("panel_positions", {}).pop(category, None)
+                        profile.get("panel_sizes", {}).pop(category, None)
+                self.model.store.save()
+        # Neither a nested dialog event loop nor render may hold Store.lock.
+        if populated:
+            QMessageBox.information(None, "整理块已有内容", "检测到内容或固定归类记录，整理块已保留。")
+            return
+        if custom: self.render()
+        else: self.render(category)
 
     def choose_monitor_and_arrange(self, preference: str) -> None:
         self.shell.remember_target_monitor(self.model.store.data["ui"], preference)
@@ -1475,7 +1775,7 @@ class QtOrganizerUI:
         ui = self.model.store.data["ui"]
         ui["layout_footprint"] = max(.45, min(.95, float(value)))
         monitor = self.shell.target_monitor(ui.get("target_monitor", "primary"))
-        automatic = self.auto_layout(self.model.scan(), monitor)
+        automatic = self.auto_layout(self._groups if getattr(self, "_groups", None) is not None else self.model.scan(), monitor)
         for category, panel in self.panels.items():
             rect = automatic.get(category)
             if rect is not None:
@@ -1510,6 +1810,7 @@ class QtOrganizerUI:
         dialog.activateWindow()
         QTimer.singleShot(220, lambda current=dialog: self._release_settings_topmost(current))
 
+    @traced("ui.settings.open")
     def settings(self) -> None:
         if self._settings_dialog and self._settings_dialog.isVisible():
             self.present_settings_dialog(self._settings_dialog)
@@ -1623,10 +1924,14 @@ class QtOrganizerUI:
                 }
             )
 
+        preview_timer = QTimer(dialog)
+        preview_timer.setSingleShot(True)
+        preview_timer.setInterval(120)
+        preview_timer.timeout.connect(preview_layout)
+
         def schedule_preview(*_args: Any) -> None:
-            # Density/font/colour/monitor preview is a deliberate complete
-            # redraw, but each of these controls changes discretely.
-            preview_layout()
+            logger.debug("settings.preview.queued")
+            preview_timer.start()
 
         def update_footprint_value(*_args: Any) -> None:
             footprint_value.setText(f"{footprint.value()}%")
@@ -1646,6 +1951,7 @@ class QtOrganizerUI:
         monitor_combo.currentIndexChanged.connect(schedule_preview)
 
         def save() -> None:
+            preview_timer.stop()
             ui.update(
                 {
                     "cell_size": density.value(),
@@ -1663,6 +1969,10 @@ class QtOrganizerUI:
             self.arrange_top_right(rebuild=True)
 
         def finish(_result: int) -> None:
+            preview_timer.stop()
+            if getattr(self, "_deferred_content_refresh", False):
+                self._groups = None
+                self._deferred_content_refresh = False
             if not saved["value"]:
                 # Every control is an in-memory preview.  Cancel and the
                 # title-bar close button restore both the original values and
@@ -1683,6 +1993,8 @@ class QtOrganizerUI:
         self.present_settings_dialog(dialog)
 
     def close(self) -> None:
+        self._icon_stop.set()
+        self.icon_timer.stop()
         self.model.store.save()
         self.shell.restore_icons()
         self._destroy_all()
