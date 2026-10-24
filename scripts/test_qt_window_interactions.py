@@ -121,7 +121,7 @@ class QtInteractionTests(unittest.TestCase):
         ui.panels = {"a": a, "b": b}
         original = QRect(20, 20, 200, 160)
         self.assertFalse(ui.finish_panel_geometry("a", original))
-        a.setGeometry.assert_called_once_with(original)
+        self.assertEqual(QRect(*a.setGeometry.call_args.args), original)
         b.move.assert_not_called()
 
     def test_geometry_bounds_and_negative_screen_positions(self):
@@ -133,6 +133,23 @@ class QtInteractionTests(unittest.TestCase):
         self.assertFalse(ui.can_place_panel(Rect("a", 8, 800, 200, 160)))
         self.assertEqual(ui._position_from_saved("+-900+8", (0, 0)), (-900, 8))
         self.assertEqual(ui._position_from_saved("-900+8", (0, 0)), (-900, 8))
+
+    def test_embedded_geometry_uses_current_QWindow_not_stale_QWidget_origin(self):
+        from PySide6.QtCore import QSize
+        handle = SimpleNamespace(mapToGlobal=lambda _: QPoint(-650, 150))
+        panel = SimpleNamespace(_desktop_parent=object(), windowHandle=lambda: handle,
+                                size=lambda: QSize(280, 230), mapToGlobal=lambda _: QPoint(50, 60))
+        self.assertEqual(PanelWindow.screen_geometry(panel), QRect(-650, 150, 280, 230))
+
+    def test_guard_hidden_child_restore_preserves_Qt_state_without_owner_z_change(self):
+        handle = SimpleNamespace(isVisible=lambda: True, setVisible=Mock())
+        shell = SimpleNamespace(desktop_host_is_safe=lambda: True, panel_is_visible=lambda _: False,
+                                show_native_child=Mock(return_value=True))
+        panel = SimpleNamespace(_desktop_parent=object(), windowHandle=lambda: handle,
+                                controller=SimpleNamespace(shell=shell), winId=lambda: 123)
+        PanelWindow.setVisible(panel, True)
+        shell.show_native_child.assert_called_once_with(123)
+        handle.setVisible.assert_not_called()
 
     def test_hidden_builtin_reappears_when_content_arrives(self):
         ui = self.make_ui()
