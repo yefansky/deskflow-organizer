@@ -1399,6 +1399,12 @@ class DesktopShell:
         for path in paths:
             try: shell.SHChangeNotify(shellcon.SHCNE_ATTRIBUTES, shellcon.SHCNF_PATHW, path, None)
             except Exception: pass
+        # ATTRIBUTES updates an existing icon's ghosted appearance, but does
+        # not re-evaluate Explorer's hidden-item filter. Re-enumerate only the
+        # affected folders, once per batch, for both hiding and restoration.
+        for parent in sorted({str(Path(path).parent) for path in paths}):
+            try: shell.SHChangeNotify(shellcon.SHCNE_UPDATEDIR, shellcon.SHCNF_PATHW, parent, None)
+            except Exception: pass
 
     def _restore_attributes(self, paths: set[str] | None = None) -> None:
         invalid = 0xFFFFFFFF

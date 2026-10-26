@@ -73,11 +73,16 @@ class PublicIcons:
         temporary.replace(self.state)
 
     @staticmethod
-    def notify(path: str):
-        shell.SHChangeNotify(shellcon.SHCNE_ATTRIBUTES, shellcon.SHCNF_PATHW, path, None)
+    def notify(paths: list[str]):
+        for path in paths:
+            shell.SHChangeNotify(shellcon.SHCNE_ATTRIBUTES, shellcon.SHCNF_PATHW, path, None)
+        # Attribute-only updates leave an already-visible hidden icon ghosted.
+        for parent in sorted({str(Path(path).parent) for path in paths}):
+            shell.SHChangeNotify(shellcon.SHCNE_UPDATEDIR, shellcon.SHCNF_PATHW, parent, None)
 
     def restore(self, paths: set[str]):
         kernel = ctypes.windll.kernel32
+        changed = []
         for path in paths:
             current = kernel.GetFileAttributesW(path)
             original = self.originals[path]
@@ -85,13 +90,15 @@ class PublicIcons:
                 self.originals.pop(path, None)
             elif kernel.SetFileAttributesW(path, original):
                 self.originals.pop(path, None)
-                self.notify(path)
+                changed.append(path)
         self.save()
+        if changed: self.notify(changed)
 
     def reconcile(self, groups: dict):
         wanted = public_paths(groups, self.root)
         self.restore(set(self.originals) - wanted)
         kernel = ctypes.windll.kernel32
+        changed = []
         for path in wanted:
             current = kernel.GetFileAttributesW(path)
             if current == INVALID: continue
@@ -99,7 +106,8 @@ class PublicIcons:
                 self.originals[path] = int(current)
                 self.save()  # Crash recovery must precede the first mutation.
             if current & 6 != 6 and kernel.SetFileAttributesW(path, current | 6):
-                self.notify(path)
+                changed.append(path)
+        if changed: self.notify(changed)
 
 
 def main():

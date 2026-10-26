@@ -32,7 +32,10 @@ class NativeIconNotificationsTest(unittest.TestCase):
     def test_local_notifications_preserve_unrelated_icon_cache(self):
         with patch.object(smart_desktop.shell, 'SHChangeNotify') as notify:
             DesktopShell._notify_desktop_changed(['G:\\Desktop\\示例.lnk'])
-        notify.assert_called_once_with(0x800, 5, 'G:\\Desktop\\示例.lnk', None)
+        self.assertEqual(notify.call_args_list, [
+            unittest.mock.call(0x800, 5, 'G:\\Desktop\\示例.lnk', None),
+            unittest.mock.call(0x1000, 5, 'G:\\Desktop', None),
+        ])
 
     def test_repeated_maintenance_does_not_notify_or_rewrite_attributes(self):
         shell = self.make_shell()
@@ -110,8 +113,10 @@ class NativeIconNotificationsTest(unittest.TestCase):
             )):
                 native_icon_guard.restore(state)
             self.assertEqual(json.loads(state.read_text(encoding='utf-8')), {})
-            event, flags, item, extra = notifier.call_args.args
-            self.assertEqual((event, flags, item.value, extra), (0x800, 5, str(path), None))
+            calls = [(event, flags, item.value, extra)
+                     for event, flags, item, extra in (call.args for call in notifier.call_args_list)]
+            self.assertEqual(calls, [(0x800, 5, str(path), None),
+                                     (0x1000, 5, str(path.parent), None)])
 
 
 if __name__ == '__main__':
