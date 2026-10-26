@@ -44,7 +44,7 @@ class PublicIconsTests(unittest.TestCase):
                 worker.reconcile(groups)
                 worker.reconcile(groups)
                 self.assertEqual(attributes[path], 38)
-                notify.assert_called_once_with(path)
+                notify.assert_called_once_with([path])
                 worker.reconcile({'inbox': [{'path': path}]})
                 self.assertEqual(attributes[path], 32)
                 self.assertEqual(worker.originals, {})

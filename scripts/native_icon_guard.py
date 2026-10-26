@@ -24,6 +24,7 @@ def restore(state_path: Path) -> None:
         return
     kernel32 = ctypes.windll.kernel32
     remaining = {}
+    restored_parents: set[str] = set()
     for raw_path, attributes in state.items():
         path = Path(raw_path)
         if not path.exists():
@@ -33,6 +34,7 @@ def restore(state_path: Path) -> None:
             if current == int(attributes):
                 continue
             if kernel32.SetFileAttributesW(str(path), int(attributes)):
+                restored_parents.add(str(path.parent))
                 # SHCNE_ATTRIBUTES + SHCNF_PATHW: refresh only this entry.
                 # ASSOCCHANGED would invalidate the global icon cache.
                 try:
@@ -41,6 +43,13 @@ def restore(state_path: Path) -> None:
                     pass
             else:
                 remaining[raw_path] = attributes
+    # Restored files must be re-enumerated to reappear after being filtered
+    # from Explorer; attribute notifications alone only update existing rows.
+    for parent in sorted(restored_parents):
+        try:
+            ctypes.windll.shell32.SHChangeNotify(0x00001000, 0x0005, ctypes.c_wchar_p(parent), None)
+        except Exception:
+            pass
     try:
         state_path.write_text(json.dumps(remaining, ensure_ascii=False), encoding="utf-8")
     except OSError:
