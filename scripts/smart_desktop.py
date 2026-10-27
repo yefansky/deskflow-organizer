@@ -149,7 +149,7 @@ class Store:
     def _defaults(self) -> dict[str, Any]:
         return {
             "version": 8, "desktop": str(DEFAULT_DESKTOP), "overrides": {}, "visual_assets": {}, "markdown_summaries": {}, "document_summaries": {}, "folder_summaries": {}, "tip_summaries": {}, "item_metadata": {},
-            "pending_inbox": {},
+            "pending_inbox": {}, "favorite_categories": [],
             "scanned_roots": [str(DEFAULT_DESKTOP)],
             "seen": {}, "category_modes": {c.id: c.mode for c in DEFAULT_CATEGORIES}, "category_sorting": {}, "item_orders": {}, "custom_blocks": [],
             "ui": {"cell_size": 48, "layout_footprint": 0.82, "font_size": 9, "icon_size": 24, "alpha": 0.22,
@@ -1643,6 +1643,9 @@ class DesktopShell:
             if ex_style & 0x00000008:  # WS_EX_TOPMOST survives some native drag loops
                 logger.warning("desktop.topmost cleared hwnd=%s", window)
                 self.user32.SetWindowPos(window, -2, 0, 0, 0, 0, flags)  # HWND_NOTOPMOST
+            if window_id in getattr(self, "hidden_panel_windows", set()):
+                if self.user32.IsWindowVisible(window): self.user32.ShowWindow(window, self.SW_HIDE)
+                continue
             if not self.user32.IsWindowVisible(window):
                 logger.warning("desktop.visibility restored hwnd=%s", window)
                 self.user32.ShowWindow(window, 4)  # SW_SHOWNOACTIVATE

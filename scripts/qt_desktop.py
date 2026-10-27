@@ -53,6 +53,7 @@ from win32com.shell import shell, shellcon
 
 from layout_engine import Rect, overlaps, pack_rectangles, can_place_rectangle, restore_rectangles
 from diagnostics import get_logger, traced, timed_operation
+from desktop_focus import DesktopClickWatcher
 
 logger = get_logger(__name__)
 
@@ -423,6 +424,18 @@ class PanelWindow(QWidget):
         self.count_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         header_layout.addWidget(self.count_label)
 
+        self.favorite_button = HeaderButton(self, "标记为常用块；双击桌面空白时保留显示")
+        self.favorite_button.setFixedSize(22, 22)
+        self.favorite_button.setCheckable(True)
+        self.favorite_button.setStyleSheet(
+            "QToolButton { color: #f4f8ff; background: transparent; border: none; font-size: 16px; }"
+            "QToolButton:checked { color: #ff7f9e; }"
+            "QToolButton:hover { background: rgba(255,255,255,28); border-radius: 4px; }"
+        )
+        self.update_favorite()
+        self.favorite_button.clicked.connect(lambda: controller.toggle_favorite(category.id))
+        header_layout.addWidget(self.favorite_button)
+
         next_mode = PANEL_MODES[(PANEL_MODES.index(mode) + 1) % len(PANEL_MODES)]
         actions = (
             ("⇅", "排序", lambda: controller.show_sort_menu(category.id, QCursor.pos())),
@@ -603,6 +616,12 @@ class PanelWindow(QWidget):
         painter.drawPath(path)
         super().paintEvent(event)
 
+    def update_favorite(self) -> None:
+        marked = self.category.id in self.controller.model.store.data.get("favorite_categories", [])
+        self.favorite_button.setChecked(marked)
+        self.favorite_button.setText("♥" if marked else "♡")
+        self.favorite_button.help_text = "取消常用块标记" if marked else "标记为常用块；双击桌面空白时保留显示"
+
     def set_plate_opacity(self, value: float) -> None:
         """Preview plate alpha without touching persisted settings or content."""
         self.plate_opacity = max(.08, min(.70, float(value)))
@@ -671,6 +690,7 @@ class QtOrganizerUI:
         self.app = QApplication.instance() or QApplication([])
         self.app.setQuitOnLastWindowClosed(False)
         self.panels: dict[str, PanelWindow] = {}
+        self.focus_favorites = False
         self.selected_item: ItemWidget | None = None
         self.group_snapshot: dict[str, tuple[tuple[str, str, bool], ...]] = {}
         self.last_desktop_signature: tuple[tuple[str, int, int], ...] = ()
@@ -704,6 +724,47 @@ class QtOrganizerUI:
         self.native_timer = QTimer()
         self.native_timer.timeout.connect(self.watch_native_drag)
         self.native_timer.start(75)
+        self.desktop_clicks = DesktopClickWatcher()
+        self.focus_timer = QTimer()
+        self.focus_timer.timeout.connect(self.watch_desktop_clicks)
+        self.focus_timer.start(20)
+
+    def watch_desktop_clicks(self) -> None:
+        for _ in range(self.desktop_clicks.poll()):
+            if not self._settings_dialog:
+                self.toggle_favorite_focus()
+
+    def toggle_favorite(self, category: str) -> None:
+        with self.model.store.lock:
+            favorites = set(self.model.store.data.get("favorite_categories", []))
+            if category in favorites:
+                favorites.remove(category)
+            else:
+                favorites.add(category)
+            self.model.store.data["favorite_categories"] = sorted(favorites)
+            self.model.store.save()
+        self.apply_favorite_visibility()
+
+    def toggle_favorite_focus(self) -> None:
+        self.focus_favorites = not getattr(self, "focus_favorites", False)
+        self.clear_selection()
+        self.apply_favorite_visibility()
+        logger.info("desktop.favorite_focus enabled=%s", self.focus_favorites)
+
+    def panel_wanted(self, category: str) -> bool:
+        return not getattr(self, "focus_favorites", False) or category in self.model.store.data.get("favorite_categories", [])
+
+    def apply_favorite_visibility(self) -> None:
+        self.shell.hidden_panel_windows = {int(panel.winId()) for category, panel in self.panels.items()
+                                           if not self.panel_wanted(category)}
+        for category, panel in self.panels.items():
+            panel.update_favorite()
+            wanted = self.panel_wanted(category)
+            if not wanted:
+                panel.hide_item_tip()
+                if self.selected_item in panel.item_widgets:
+                    self.clear_selection()
+            panel.setVisible(wanted)
 
     def categories(self) -> list[Any]:
         return self.categories_provider(self.model.store)
@@ -979,7 +1040,7 @@ class QtOrganizerUI:
                     profile.get("panel_positions", {}).get(category.id, ""), (x, y)
                 )
             panel.setGeometry(x, y, width, height)
-            panel.show()
+            panel.setVisible(self.panel_wanted(category.id))
             attached.append(self.shell.attach(int(panel.winId())))
             self.panels[category.id] = panel
 
@@ -989,6 +1050,7 @@ class QtOrganizerUI:
             self._destroy_all()
             self.shell.restore_icons()
             return
+        self.apply_favorite_visibility()
         self.shell.keep_panels_above_desktop_backdrop()
         if only is None and (structural_change or display_changed):
             bounds = (monitor["left"], monitor["top"], monitor["right"], monitor["bottom"])
@@ -1014,7 +1076,8 @@ class QtOrganizerUI:
                         profile.setdefault("panel_sizes", {})[category] = {"width": rect.width, "height": rect.height}
                     self.model.store.save()
         if self.panels and all(
-            self.shell.panel_is_visible(int(panel.winId())) for panel in self.panels.values()
+            not self.panel_wanted(category) or self.shell.panel_is_visible(int(panel.winId()))
+            for category, panel in self.panels.items()
         ):
             self.shell.hide_icons(self.organized_paths(groups))
         else:
@@ -1041,7 +1104,8 @@ class QtOrganizerUI:
                 logger.info("desktop.recovery rebuild_missing_panels")
                 self.render()
             elif all(self.shell.panel_is_desktop_child(int(panel.winId())) and
-                     self.shell.panel_is_visible(int(panel.winId())) for panel in self.panels.values()):
+                     (not self.panel_wanted(category) or self.shell.panel_is_visible(int(panel.winId())))
+                     for category, panel in self.panels.items()):
                 self.shell.hide_icons(self.organized_paths(self._groups or {}))
         self.shell.retry_icon_attributes()
         rerender = False
@@ -1346,7 +1410,7 @@ class QtOrganizerUI:
 
     def panel_at(self, point: QPoint) -> str | None:
         for category, panel in self.panels.items():
-            if panel.geometry().contains(point):
+            if self.panel_wanted(category) and panel.geometry().contains(point):
                 return category
         return None
 
@@ -1993,6 +2057,8 @@ class QtOrganizerUI:
         self.present_settings_dialog(dialog)
 
     def close(self) -> None:
+        self.focus_timer.stop()
+        self.desktop_clicks.close()
         self._icon_stop.set()
         self.icon_timer.stop()
         self.model.store.save()

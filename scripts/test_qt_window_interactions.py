@@ -164,7 +164,7 @@ class QtInteractionTests(unittest.TestCase):
             panel.show()
             self.app.processEvents()
             buttons = panel.findChildren(HeaderButton)
-            self.assertEqual(len(buttons), 5)
+            self.assertEqual(len(buttons), 6)
             self.assertTrue(all(button.help_timer.interval() == 2000 and button.help_text for button in buttons))
             for width in (420, 310):
                 panel.resize(width, 440)

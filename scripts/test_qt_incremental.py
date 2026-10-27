@@ -5,7 +5,7 @@ import time
 import threading
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import QImage
@@ -33,7 +33,7 @@ class Fixture:
             return deepcopy(self.groups)
         def save():
             self.saved += 1
-        model = SimpleNamespace(store=SimpleNamespace(data=self.data, save=save), scan=scan,
+        model = SimpleNamespace(store=SimpleNamespace(data=self.data, save=save, lock=threading.RLock()), scan=scan,
                                 sorted_items=lambda _category, items: list(items), desktop_signature=lambda: ())
         shell = SimpleNamespace(reconcile_target_monitor=lambda _ui: False, host=1, panel_windows={},
                                 _find_overlay_host=lambda: 1,
@@ -44,9 +44,12 @@ class Fixture:
         shell.retry_icon_attributes = lambda: None
         shell.monitors = lambda: []
         shell.remember_target_monitor = lambda ui, target: ui.update(target_monitor=target)
-        self.ui = ui_type(model, queue.Queue(), shell, lambda _store: self.categories)
+        with patch("qt_desktop.DesktopClickWatcher", return_value=Mock(poll=lambda: 0)):
+            self.ui = ui_type(model, queue.Queue(), shell, lambda _store: self.categories)
 
     def close(self):
+        self.ui.focus_timer.stop()
+        self.ui.desktop_clicks.close()
         self.ui.tick_timer.stop()
         self.ui.native_timer.stop()
         if hasattr(self.ui, "icon_timer"):
