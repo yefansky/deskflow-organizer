@@ -30,6 +30,10 @@ v0.2 的 ZIP 更新器仍可下载 `DESKFLOW-windows-x64.zip`，它现在是迁�
 
 ## 让代码 agent 操作桌面
 
+推荐按需读取 [AI 接入说明](AI接入说明.md)：让 Codex 从正在运行的 Deskflow 进程找到源码或安装目录，读说明后直接调用已有本机接口。无需安装全局 skill、注册 MCP 或修改 agent 配置；源码运行与安装版都可用，不影响已有分类。
+
+下列 MCP 是可选兼容方式，无需为普通按需操作全局启用。
+
 安装版自带标准输入输出 MCP 服务，入口为安装目录的 `DeskflowMCP.exe`。它支持目录读取、摘要、标签、批量归类、分类管理、布局、样式、排序和位置调整，服务仅连接本机。
 
 运行 `DeskflowMCP.exe --print-config` 可输出当前机器的绝对路径配置，无需安装开发环境。接入后 agent 可通过标准 `tools/list` 自动发现18个工具，通过 `resources/list` / `prompts/list` 发现整理说明；紧凑目录提供分类、图标顺序与人工归类，`get_desktop_arrangement` 提供保存的块位置和排布。批量整理支持无写入预演，默认保护人工分类。

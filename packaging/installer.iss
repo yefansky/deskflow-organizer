@@ -35,6 +35,7 @@ Source: "legacy-launch.py"; DestDir: "{app}\scripts"; DestName: "deskflow_manage
 Source: "legacy-launch.py"; DestDir: "{app}\scripts"; DestName: "smart_desktop.py"; Flags: ignoreversion
 Source: "legacy-uninstall.ps1"; DestDir: "{app}"; DestName: "uninstall.ps1"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\AI接入说明.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\docs\MCP.md"; DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "..\VERSION"; DestDir: "{app}"; Flags: ignoreversion
 

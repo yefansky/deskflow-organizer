@@ -1,5 +1,7 @@
 # DESKFLOW MCP 接入与能力发现
 
+普通按需操作推荐先读根目录 [AI 接入说明](../AI接入说明.md)，从运行进程定位产品后直接调用已有本机接口，无需安装 skill、注册 MCP 或修改 agent 配置。以下 MCP 配置仅供明确需要长期连接的客户端选用。
+
 安装版自带 `DeskflowMCP.exe`，其他代码 agent 无需安装 Python、Git 或开发环境。服务使用标准 MCP **stdio**，只通过 `127.0.0.1:8765` 访问本机整理器。这个 HTTP 端口是内部应用 API，不是 Streamable HTTP MCP 地址；不要把它直接配置为 MCP URL，也不需要开放外网端口。
 
 ## 生成当前机器配置
