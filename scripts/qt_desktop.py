@@ -748,6 +748,30 @@ class QtOrganizerUI:
     def toggle_favorite_focus(self) -> None:
         self.focus_favorites = not getattr(self, "focus_favorites", False)
         self.clear_selection()
+        monitor = self.shell.target_monitor(self.model.store.data["ui"].get("target_monitor", "primary"))
+        profile = self.layout_profile(monitor)
+        automatic = self.auto_layout(self._groups if self._groups is not None else self.model.scan(), monitor)
+        for category, panel in self.panels.items():
+            if self.focus_favorites and not self.panel_wanted(category):
+                continue
+            x, y, width, height = automatic[category]
+            if not profile.get("auto_layout", True):
+                size = profile.get("panel_sizes", {}).get(category, {})
+                width, height = int(size.get("width", width)), int(size.get("height", height))
+                x, y = self._position_from_saved(profile.get("panel_positions", {}).get(category, ""), (x, y))
+            panel.setGeometry(x, y, width, height)
+        if self.focus_favorites:
+            requested = [Rect(category, panel.x(), panel.y(), panel.width(), panel.height())
+                         for category, panel in self.panels.items() if self.panel_wanted(category)]
+            bounds = (monitor["left"], monitor["top"], monitor["right"], monitor["bottom"])
+            repaired = restore_rectangles(requested, bounds, margin=8)
+            if any(repaired[item.key] != item for item in requested):
+                for category, rect in repaired.items():
+                    self.panels[category].setGeometry(rect.x, rect.y, rect.width, rect.height)
+                    profile.setdefault("panel_positions", {})[category] = f"+{rect.x}+{rect.y}"
+                    profile.setdefault("panel_sizes", {})[category] = {"width": rect.width, "height": rect.height}
+                if not self._settings_preview:
+                    self.model.store.save()
         self.apply_favorite_visibility()
         logger.info("desktop.favorite_focus enabled=%s", self.focus_favorites)
 
@@ -1056,7 +1080,7 @@ class QtOrganizerUI:
             bounds = (monitor["left"], monitor["top"], monitor["right"], monitor["bottom"])
             requested = [
                 Rect(category, panel.x(), panel.y(), panel.width(), panel.height())
-                for category, panel in self.panels.items()
+                for category, panel in self.panels.items() if self.panel_wanted(category)
             ]
             packed = (
                 {item.key: item for item in requested}
@@ -1064,6 +1088,8 @@ class QtOrganizerUI:
                 else restore_rectangles(requested, bounds, margin=8)
             )
             for category, panel in self.panels.items():
+                if category not in packed:
+                    continue
                 rect = packed[category]
                 if (panel.x(), panel.y(), panel.width(), panel.height()) != (rect.x, rect.y, rect.width, rect.height):
                     panel.setGeometry(rect.x, rect.y, rect.width, rect.height)
@@ -1275,7 +1301,25 @@ class QtOrganizerUI:
             profiles[key] = {"auto_layout": True, "panel_positions": {}, "panel_sizes": {}}
             if not self._settings_preview:
                 self.model.store.save()
-        self.active_profile = profiles[key]
+        normal = profiles[key]
+        if getattr(self, "focus_favorites", False):
+            modes = normal.setdefault("mode_layouts", {})
+            if "favorites" not in modes:
+                # Initialize from the target display's normal profile, not the
+                # old display's window coordinates during monitor recovery.
+                modes["favorites"] = {"auto_layout": False, "panel_positions": {}, "panel_sizes": {}}
+                groups = self._groups if self._groups is not None else self.model.scan()
+                automatic = self.auto_layout(groups, monitor)
+                for category, (x, y, width, height) in automatic.items():
+                    if not normal.get("auto_layout", True):
+                        size = normal.get("panel_sizes", {}).get(category, {})
+                        width, height = int(size.get("width", width)), int(size.get("height", height))
+                        x, y = self._position_from_saved(normal.get("panel_positions", {}).get(category, ""), (x, y))
+                    modes["favorites"]["panel_positions"][category] = f"+{x}+{y}"
+                    modes["favorites"]["panel_sizes"][category] = {"width": width, "height": height}
+            self.active_profile = modes["favorites"]
+        else:
+            self.active_profile = normal
         return self.active_profile
 
     def arrange_top_right(self, rebuild: bool = False) -> None:
@@ -1292,6 +1336,8 @@ class QtOrganizerUI:
                 return
         automatic = self.auto_layout(self._groups if getattr(self, "_groups", None) is not None else self.model.scan(), monitor)
         for category, panel in self.panels.items():
+            if not self.panel_wanted(category):
+                continue
             x, y, width, height = automatic[category]
             panel.setGeometry(x, y, width, height)
             profile.setdefault("panel_positions", {})[category] = f"+{x}+{y}"
@@ -1314,7 +1360,7 @@ class QtOrganizerUI:
         occupied = [
             (panel.x(), panel.y(), panel.width(), panel.height())
             for name, panel in self.panels.items()
-            if name != category
+            if name != category and self.panel_wanted(name)
         ]
 
         def free(x: int, y: int) -> bool:
@@ -1338,7 +1384,7 @@ class QtOrganizerUI:
 
     def can_place_panel(self, candidate: Rect) -> bool:
         if not can_place_rectangle(candidate, [Rect(name, panel.x(), panel.y(), panel.width(), panel.height())
-                                               for name, panel in self.panels.items()]):
+                                               for name, panel in self.panels.items() if self.panel_wanted(name)]):
             return False
         monitor = self.shell.target_monitor(self.model.store.data["ui"].get("target_monitor", "primary"))
         return (candidate.width > 0 and candidate.height > 0
@@ -1777,9 +1823,15 @@ class QtOrganizerUI:
                     ui.get("panel_styles", {}).pop(category, None)
                     self.model.store.data.get("category_sorting", {}).pop(category, None)
                     self.model.store.data.get("item_orders", {}).pop(category, None)
+                    self.model.store.data["favorite_categories"] = [
+                        item for item in self.model.store.data.get("favorite_categories", []) if item != category
+                    ]
                     for profile in ui.get("layout_profiles", {}).values():
                         profile.get("panel_positions", {}).pop(category, None)
                         profile.get("panel_sizes", {}).pop(category, None)
+                        for mode_profile in profile.get("mode_layouts", {}).values():
+                            mode_profile.get("panel_positions", {}).pop(category, None)
+                            mode_profile.get("panel_sizes", {}).pop(category, None)
                 self.model.store.save()
         # Neither a nested dialog event loop nor render may hold Store.lock.
         if populated:

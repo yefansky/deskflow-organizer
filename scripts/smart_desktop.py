@@ -1107,11 +1107,17 @@ class OrganizerModel:
                     self.store.data.get("category_modes", {}).pop(identifier, None)
                     self.store.data.get("category_sorting", {}).pop(identifier, None)
                     self.store.data.get("item_orders", {}).pop(identifier, None)
+                    self.store.data["favorite_categories"] = [
+                        item for item in self.store.data.get("favorite_categories", []) if item != identifier
+                    ]
                     ui.get("category_names", {}).pop(identifier, None)
                     ui.get("panel_styles", {}).pop(identifier, None)
                     for profile in ui.get("layout_profiles", {}).values():
                         profile.get("panel_positions", {}).pop(identifier, None)
                         profile.get("panel_sizes", {}).pop(identifier, None)
+                        for mode_profile in profile.get("mode_layouts", {}).values():
+                            mode_profile.get("panel_positions", {}).pop(identifier, None)
+                            mode_profile.get("panel_sizes", {}).pop(identifier, None)
             self.store.save()
         return {"ok": True, "dry_run": False, "changes": prepared}
 

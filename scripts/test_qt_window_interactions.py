@@ -35,6 +35,7 @@ class QtInteractionTests(unittest.TestCase):
 
     def test_empty_custom_removal_requires_confirmation(self):
         ui = self.make_ui()
+        ui.model.store.data["favorite_categories"] = ["custom", "other"]
         with patch.object(ui, "confirm_empty_block", return_value=False):
             ui.delete_empty_block("custom")
         self.assertEqual(ui.model.store.data["custom_blocks"], [{"id": "custom"}])
@@ -42,6 +43,7 @@ class QtInteractionTests(unittest.TestCase):
         with patch.object(ui, "confirm_empty_block", return_value=True):
             ui.delete_empty_block("custom")
         self.assertEqual(ui.model.store.data["custom_blocks"], [])
+        self.assertEqual(ui.model.store.data["favorite_categories"], ["other"])
 
     def test_builtin_removal_preserves_classification_and_explains_reappearance(self):
         ui = self.make_ui()

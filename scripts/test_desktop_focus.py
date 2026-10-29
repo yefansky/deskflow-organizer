@@ -92,6 +92,8 @@ class FavoriteTests(unittest.TestCase):
         self.assertIs(ui.panels["a"], panel)
         self.assertEqual(geometry, {key: p.geometry() for key, p in ui.panels.items()})
         fixture.data.pop("favorite_categories")
+        for profile in fixture.data["ui"]["layout_profiles"].values():
+            profile.pop("mode_layouts", None)
         self.assertEqual(fixture.data, original)
 
     def test_no_favorites_and_all_favorites_restore_without_saving_switch(self):
@@ -104,6 +106,36 @@ class FavoriteTests(unittest.TestCase):
         self.ui.toggle_favorite("b")
         self.ui.toggle_favorite_focus()
         self.assertTrue(all(p.isVisible() for p in self.ui.panels.values()))
+
+    def test_independent_positions_survive_rebuild_and_return_to_focus(self):
+        ui = self.ui
+        ui.toggle_favorite("a")
+        normal = {key: p.geometry() for key, p in ui.panels.items()}
+        ui.toggle_favorite_focus()
+        # The hidden block is not an obstacle in focus mode.
+        target = normal["b"].topLeft()
+        original = ui.panels["a"].pos()
+        ui.panels["a"].move(target)
+        self.assertTrue(ui.finish_panel_geometry("a", original))
+        focused = ui.panels["a"].geometry()
+        ui.render("a")
+        self.assertEqual(ui.panels["a"].geometry(), focused)
+        ui.toggle_favorite_focus()
+        self.assertEqual({key: p.geometry() for key, p in ui.panels.items()}, normal)
+        ui.toggle_favorite_focus()
+        self.assertEqual(ui.panels["a"].geometry(), focused)
+
+    def test_focus_collision_rejects_without_changing_normal_layout(self):
+        ui = self.ui
+        ui.toggle_favorite("a")
+        ui.toggle_favorite("b")
+        ui.toggle_favorite_focus()
+        normal_profile = deepcopy(next(iter(self.fixture.data["ui"]["layout_profiles"].values())))
+        original = ui.panels["a"].pos()
+        ui.panels["a"].move(ui.panels["b"].pos())
+        self.assertFalse(ui.finish_panel_geometry("a", original))
+        self.assertEqual(ui.panels["a"].pos(), original)
+        self.assertEqual(next(iter(self.fixture.data["ui"]["layout_profiles"].values())), normal_profile)
 
     def test_render_tick_mode_rebuild_and_new_content_preserve_focus(self):
         self.ui.toggle_favorite("a")
