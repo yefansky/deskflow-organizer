@@ -420,7 +420,7 @@ class Manager:
     def write_autostart_entry():
         """Login must enter through the manager so the tray is always alive."""
         STARTUP.parent.mkdir(parents=True,exist_ok=True)
-        STARTUP.write_text('@echo off\r\nstart "" ' + subprocess.list2cmdline(command("manager", "--start")) + '\r\n',encoding="utf-8")
+        STARTUP.write_bytes(('@echo off\r\nchcp 65001 >nul\r\nstart "" ' + subprocess.list2cmdline(command("manager", "--start")) + '\r\n').encode("utf-8"))
     def set_tray(self):
         self.data["minimize_to_tray"]=bool(self.tray.get()); save(self.data)
     @staticmethod
