@@ -19,8 +19,8 @@ from time import perf_counter
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QEvent, QFileInfo, QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QCursor, QFont, QIcon, QImage, QPixmap, QPainter, QPainterPath, QPen, QWindow
+from PySide6.QtCore import QFileInfo, QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QCursor, QFont, QIcon, QImage, QPixmap, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -51,7 +51,7 @@ from PySide6.QtWidgets import (
 from shiboken6 import isValid
 from win32com.shell import shell, shellcon
 
-from layout_engine import Rect, overlaps, pack_rectangles, can_place_rectangle, restore_rectangles, resize_rectangle
+from layout_engine import Rect, overlaps, pack_rectangles, can_place_rectangle, restore_rectangles
 from diagnostics import get_logger, traced, timed_operation
 from desktop_focus import DesktopClickWatcher
 
@@ -65,38 +65,6 @@ PANEL_MODE_LABELS = {
     "cards": "纯图标网格",
 }
 PANEL_MODE_GLYPHS = {"list": "☷", "compact": "≡", "cards": "▦"}
-
-# A foreign-parented QWindow can change its client size when it is first shown:
-# Qt applies the widget's minimum-size hints and layout size constraints during
-# show, so the post-show height/width can differ from the requested geometry by
-# a few pixels.  Screen coordinates are the part that must map exactly, because
-# a wrong parent/mapping shows up as positional drift (or a size jump far beyond
-# layout adjustments).  Allow a bounded client-size adjustment, fail closed for
-# everything else.
-CHILD_GEOMETRY_SIZE_TOLERANCE = 8
-
-
-def _child_geometry_matches(expected: QRect, actual: QRect) -> bool:
-    """Position must match exactly; size may differ by the show-time tolerance."""
-    if expected.topLeft() != actual.topLeft(): return False
-    return (abs(expected.width() - actual.width()) <= CHILD_GEOMETRY_SIZE_TOLERANCE
-            and abs(expected.height() - actual.height()) <= CHILD_GEOMETRY_SIZE_TOLERANCE)
-
-
-def _screen_geometry(panel) -> QRect:
-    if hasattr(panel, "screen_geometry"): return panel.screen_geometry()
-    return QRect(panel.x(), panel.y(), panel.width(), panel.height())
-
-
-def _set_screen_geometry(panel, *args) -> None:
-    rect = QRect(args[0]) if len(args) == 1 else QRect(*args)
-    if hasattr(panel, "set_screen_geometry"): panel.set_screen_geometry(rect)
-    else: panel.setGeometry(rect.x(), rect.y(), rect.width(), rect.height())
-
-
-def _move_screen(panel, point: QPoint) -> None:
-    if hasattr(panel, "move_screen"): panel.move_screen(point)
-    else: panel.move(point)
 
 
 def _with_shadow(widget: QWidget, strength: int = 220) -> None:
@@ -129,7 +97,7 @@ class HeaderBar(QWidget):
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.MouseButton.LeftButton:
             self._start_global = event.globalPosition().toPoint()
-            self._start_panel = _screen_geometry(self.panel).topLeft()
+            self._start_panel = self.panel.pos()
             self.panel.controller.shell.keep_panels_above_desktop_backdrop()
             event.accept()
             return
@@ -146,7 +114,7 @@ class HeaderBar(QWidget):
             x, y = self.panel.controller.bound_position(
                 wanted.x(), wanted.y(), self.panel.width(), self.panel.height()
             )
-            _move_screen(self.panel, QPoint(x, y))
+            self.panel.move(x, y)
             candidate = Rect(self.panel.category.id, x, y, self.panel.width(), self.panel.height())
             self.setCursor(Qt.CursorShape.SizeAllCursor if self.panel.controller.can_place_panel(candidate)
                            else Qt.CursorShape.ForbiddenCursor)
@@ -414,9 +382,6 @@ class PanelWindow(QWidget):
             | Qt.WindowType.WindowDoesNotAcceptFocus
         )
         super().__init__(None, flags)
-        self._desktop_parent: QWindow | None = None
-        self._registered_hwnd = 0
-        self._closing = False
         self.controller, self.category, self.items, self.mode = controller, category, items, mode
         self.setObjectName(f"deskflow-panel-{category.id}")
         self.setWindowTitle(f"DESKFLOW:{category.id}")
@@ -527,140 +492,6 @@ class PanelWindow(QWidget):
         outer.addWidget(self.scroll, 1)
         self.tip_bubble = TipBubble(self)
         self._tip_generation = 0
-
-    def screen_geometry(self) -> QRect:
-        # QWidget caches the old top-level origin until a later event delivery.
-        # QWindow already knows its actual foreign parent synchronously.
-        handle = self.windowHandle()
-        return QRect(handle.mapToGlobal(QPoint(0, 0)), self.size()) if self._desktop_parent and handle else self.geometry()
-
-    def set_screen_geometry(self, rect: QRect) -> None:
-        position = self._desktop_parent.mapFromGlobal(rect.topLeft()) if self._desktop_parent else rect.topLeft()
-        self.setGeometry(QRect(position, rect.size()))
-
-    def move_screen(self, point: QPoint) -> None:
-        self.set_screen_geometry(QRect(point, self.size()))
-
-    def attach_to_desktop(self) -> bool:
-        shell = self.controller.shell
-        # Non-native test Shells exercise controls without touching a real HWND.
-        if not hasattr(shell, "attach_native_child"):
-            self.show()
-            return shell.attach(int(self.winId()))
-        if self._desktop_parent is not None:
-            return shell.host == int(self._desktop_parent.winId()) and shell.panel_is_desktop_child(int(self.winId()))
-        if not shell.desktop_host_is_safe():
-            logger.warning("desktop.attach fail_closed host=%s reason=host_band_or_identity_unsafe", shell.host)
-            return False
-        geometry = self.screen_geometry()
-        self.winId()  # Create our hidden native window before assigning a foreign parent.
-        if not shell.native_child_preflight(int(self.winId())): return False
-        self._desktop_parent = QWindow.fromWinId(shell.host)
-        if self._desktop_parent is None:
-            logger.error("desktop.qt.foreign_parent unavailable host=%s", shell.host)
-            return False
-        self.windowHandle().setParent(self._desktop_parent)
-        self.set_screen_geometry(geometry)
-        if not shell.attach_native_child(int(self.winId())): return False
-        self._registered_hwnd = int(self.winId())
-        self.show()
-        return self._confirm_child_geometry(geometry) and shell.panel_is_desktop_child(int(self.winId())) and shell.desktop_host_is_safe()
-
-    def _confirm_child_geometry(self, expected: QRect) -> bool:
-        """Verify the embedded child landed at the requested screen position.
-
-        show() may legitimately adjust the client size by a few pixels (layout
-        and minimum-size hints), so only the position has to be exact; a size
-        difference beyond CHILD_GEOMETRY_SIZE_TOLERANCE still means the child is
-        not the window we placed, and is treated as a mapping failure.
-        """
-        actual = self.screen_geometry()
-        if _child_geometry_matches(expected, actual):
-            if actual.size() != expected.size():
-                logger.info("desktop.child.size adjusted expected=%s actual=%s", expected, actual)
-            return True
-        logger.error("desktop.child.geometry mismatch expected=%s actual=%s host=%s", expected, actual, self.controller.shell.host)
-        shell = self.controller.shell
-        shell.hide_native_child(int(self.winId()))
-        shell._rejected_host = shell.host
-        shell.desktop_available = False
-        shell.renderer_error = "桌面窗口坐标映射校验失败，已保留原生桌面图标。请查看诊断日志。"
-        return False
-
-    def setVisible(self, visible: bool) -> None:  # type: ignore[override]
-        if getattr(self, "_desktop_parent", None) is not None:
-            handle = self.windowHandle()
-            if handle is None:
-                self.controller.shell.restore_icons()
-                return
-            # QWidget.show on an externally parented Tool can raise the foreign
-            # desktop root. QWindow visibility preserves the real child band and
-            # still updates QWidget/child logical visibility and expose state.
-            if visible and not self.controller.shell.desktop_host_is_safe():
-                self.controller.shell.hide_native_child(int(self.winId()))
-                self.controller.shell.desktop_available = False
-                self.controller.shell.restore_icons()
-                return
-            if visible and handle.isVisible() and not self.controller.shell.panel_is_visible(int(self.winId())):
-                # The safety guard hid only the native child, preserving Qt's
-                # logical state. Restore that state without a no-op Qt show or
-                # reordering the desktop root/other applications.
-                self.controller.shell.show_native_child(int(self.winId()))
-            else:
-                handle.setVisible(visible)
-        else:
-            super().setVisible(visible)
-
-    def show(self) -> None:
-        self.setVisible(True)
-
-    def showNormal(self) -> None:
-        self.show()
-
-    def close(self) -> bool:
-        self._closing = True
-        return super().close()
-
-    def event(self, event) -> bool:  # type: ignore[override]
-        result = super().event(event)
-        if (event.type() == QEvent.Type.WinIdChange and getattr(self, "_desktop_parent", None) is not None
-                and not getattr(self, "_closing", False)):
-            self._reattach_after_win_id_change(int(self.internalWinId()))
-        return result
-
-    def _should_be_visible(self) -> bool:
-        wanted = getattr(self.controller, "panel_wanted", None)
-        return True if wanted is None else bool(wanted(self.category.id))
-
-    def _reattach_after_win_id_change(self, new_hwnd: int) -> None:
-        """Re-register a Qt-recreated HWND and keep the focus-mode hidden set in sync.
-
-        Favorite focus tracks native handles in Shell.hidden_panel_windows. A
-        recreated HWND would otherwise leave a stale entry behind, and the icon
-        fail-closed guard would read the block as "should be visible but isn't"
-        and restore native icons. The set is therefore reconciled here, before
-        the next render/tick, and an intentionally hidden block is never shown.
-        """
-        shell = self.controller.shell
-        old_hwnd = self._registered_hwnd
-        hidden = getattr(shell, "hidden_panel_windows", None)
-        shell.panel_windows.pop(old_hwnd, None)
-        if hidden is not None and old_hwnd: hidden.discard(old_hwnd)
-        self._registered_hwnd = 0
-        if new_hwnd and shell.attach_native_child(new_hwnd):
-            self._registered_hwnd = new_hwnd
-            if hidden is not None:
-                hidden.discard(new_hwnd)
-                if not self._should_be_visible():
-                    hidden.add(new_hwnd)
-                    shell.hide_native_child(new_hwnd)
-        else:
-            if new_hwnd:
-                if hidden is not None: hidden.discard(new_hwnd)
-                shell.hide_native_child(new_hwnd)
-            shell.restore_icons()
-            self._appearance = None
-            self.controller.events.put({"type": "render"})
 
     def _reflow_items(self) -> None:
         """Repack existing item widgets without rebuilding the panel window."""
@@ -809,19 +640,6 @@ class PanelWindow(QWidget):
         return edges
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
-        state = getattr(self, "_manual_resize", None)
-        if state is not None:
-            edges, start, original = state
-            delta = event.globalPosition().toPoint() - start
-            edge_name = "_".join(name for edge, name in ((Qt.Edge.TopEdge, "top"), (Qt.Edge.BottomEdge, "bottom"),
-                                                    (Qt.Edge.LeftEdge, "left"), (Qt.Edge.RightEdge, "right")) if edges & edge)
-            monitor = self.controller.shell.target_monitor(self.controller.model.store.data["ui"].get("target_monitor", "primary"))
-            rect = resize_rectangle(Rect(self.category.id, original.x(), original.y(), original.width(), original.height()),
-                                    edge_name, delta.x(), delta.y(),
-                                    (monitor["left"], monitor["top"], monitor["right"], monitor["bottom"]), margin=8)
-            self.set_screen_geometry(QRect(rect.x, rect.y, rect.width, rect.height))
-            event.accept()
-            return
         edges = self._resize_edges(event.position().toPoint())
         cursors = {
             Qt.Edge.LeftEdge: Qt.CursorShape.SizeHorCursor,
@@ -845,11 +663,7 @@ class PanelWindow(QWidget):
             edges = self._resize_edges(event.position().toPoint())
             handle = self.windowHandle()
             if edges and handle:
-                self._resize_original = self.screen_geometry()
-                if self._desktop_parent is not None:
-                    self._manual_resize = (edges, event.globalPosition().toPoint(), self._resize_original)
-                    event.accept()
-                    return
+                self._resize_original = self.geometry()
             if edges and handle and handle.startSystemResize(edges):
                 event.accept()
                 return
@@ -858,7 +672,6 @@ class PanelWindow(QWidget):
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         self.controller.finish_panel_geometry(self.category.id, getattr(self, "_resize_original", None))
         self._resize_original = None
-        self._manual_resize = None
         super().mouseReleaseEvent(event)
 
 
@@ -946,15 +759,15 @@ class QtOrganizerUI:
                 size = profile.get("panel_sizes", {}).get(category, {})
                 width, height = int(size.get("width", width)), int(size.get("height", height))
                 x, y = self._position_from_saved(profile.get("panel_positions", {}).get(category, ""), (x, y))
-            _set_screen_geometry(panel, x, y, width, height)
-        requested = [Rect(category, _screen_geometry(panel).x(), _screen_geometry(panel).y(), panel.width(), panel.height())
+            panel.setGeometry(x, y, width, height)
+        requested = [Rect(category, panel.x(), panel.y(), panel.width(), panel.height())
                      for category, panel in self.panels.items() if self.panel_wanted(category)]
         bounds = (monitor["left"], monitor["top"], monitor["right"], monitor["bottom"])
         repaired = restore_rectangles(requested, bounds, margin=8)
         for item in requested:
             rect = repaired[item.key]
             if rect != item:
-                _set_screen_geometry(self.panels[item.key], rect.x, rect.y, rect.width, rect.height)
+                self.panels[item.key].setGeometry(rect.x, rect.y, rect.width, rect.height)
         # Screen/work-area changes can be temporary.  Keep these visibility
         # corrections transient until the user moves a panel.
         self.apply_favorite_visibility()
@@ -1177,17 +990,10 @@ class QtOrganizerUI:
         # retain a selection reference across that boundary: a later right
         # click would otherwise call update() on an already deleted C++ object.
         self.shell.host = self.shell._find_overlay_host()
-        if not self.shell.host or (hasattr(self.shell, "desktop_host_is_safe") and not self.shell.desktop_host_is_safe()):
-            if not getattr(self, "_renderer_fail_logged", False):
-                # Fail-closed diagnosis without any window title/path: the block
-                # layer stays off until the desktop host band is provably safe.
-                self._renderer_fail_logged = True
-                logger.warning("desktop.render fail_closed host=%s reason=%s", self.shell.host,
-                               "host_missing" if not self.shell.host else "host_band_or_identity_unsafe")
+        if not self.shell.host:
             self._destroy_all()
             self.shell.restore_icons()
             return
-        self._renderer_fail_logged = False
         ui = self.model.store.data["ui"]
         monitor = self.shell.target_monitor(ui.get("target_monitor", "primary"))
         current_bounds = (monitor["left"], monitor["top"], monitor["right"], monitor["bottom"])
@@ -1236,7 +1042,7 @@ class QtOrganizerUI:
                         size = profile.get("panel_sizes", {}).get(category.id, {})
                         width, height = int(size.get("width", width)), int(size.get("height", height))
                         x, y = self._position_from_saved(profile.get("panel_positions", {}).get(category.id, ""), (x, y))
-                    _set_screen_geometry(previous, x, y, width, height)
+                    previous.setGeometry(x, y, width, height)
                 continue
             if previous is not None:
                 if self.selected_item in previous.item_widgets:
@@ -1255,8 +1061,9 @@ class QtOrganizerUI:
                 x, y = self._position_from_saved(
                     profile.get("panel_positions", {}).get(category.id, ""), (x, y)
                 )
-            _set_screen_geometry(panel, x, y, width, height)
-            attached.append(panel.attach_to_desktop())
+            panel.setGeometry(x, y, width, height)
+            panel.setVisible(self.panel_wanted(category.id))
+            attached.append(self.shell.attach(int(panel.winId())))
             self.panels[category.id] = panel
 
         if not all(attached) or not all(
@@ -1264,17 +1071,13 @@ class QtOrganizerUI:
         ):
             self._destroy_all()
             self.shell.restore_icons()
-            if not getattr(self, "_renderer_error_shown", False):
-                self._renderer_error_shown = True
-                QMessageBox.warning(None, "桌面整理层已安全停用", getattr(self.shell, "renderer_error",
-                                    "无法确认整理块处于安全桌面层级，已保留原生桌面图标。请查看诊断日志。"))
             return
         self.apply_favorite_visibility()
         self.shell.keep_panels_above_desktop_backdrop()
         if structural_change or display_changed:
             bounds = (monitor["left"], monitor["top"], monitor["right"], monitor["bottom"])
             requested = [
-                Rect(category, _screen_geometry(panel).x(), _screen_geometry(panel).y(), panel.width(), panel.height())
+                Rect(category, panel.x(), panel.y(), panel.width(), panel.height())
                 for category, panel in self.panels.items() if self.panel_wanted(category)
             ]
             packed = (
@@ -1286,8 +1089,8 @@ class QtOrganizerUI:
                 if category not in packed:
                     continue
                 rect = packed[category]
-                if (_screen_geometry(panel).x(), _screen_geometry(panel).y(), panel.width(), panel.height()) != (rect.x, rect.y, rect.width, rect.height):
-                    _set_screen_geometry(panel, rect.x, rect.y, rect.width, rect.height)
+                if (panel.x(), panel.y(), panel.width(), panel.height()) != (rect.x, rect.y, rect.width, rect.height):
+                    panel.setGeometry(rect.x, rect.y, rect.width, rect.height)
             # Packing only makes saved geometry visible on this work area; it
             # must not overwrite the user's durable positions on reconnect.
         if self.panels and all(
@@ -1308,7 +1111,7 @@ class QtOrganizerUI:
     @traced("ui.tick")
     def tick(self) -> None:
         desktop_recovered = self.shell.keep_panels_above_desktop_backdrop()
-        if desktop_recovered and self.shell.host and getattr(self.shell, "desktop_available", True):
+        if desktop_recovered and self.shell.host:
             invalid = [category for category, panel in self.panels.items()
                        if int(panel.winId()) not in self.shell.panel_windows]
             for category in invalid:
@@ -1318,14 +1121,7 @@ class QtOrganizerUI:
             if not self.panels:
                 logger.info("desktop.recovery rebuild_missing_panels")
                 self.render()
-            else:
-                # Validation only: the safety guard may have hidden a native child
-                # while Qt still considers it logically visible. Never raises or
-                # reorders anything; intentionally hidden blocks are left alone.
-                for category, panel in self.panels.items():
-                    if self.panel_wanted(category) and not self.shell.panel_is_visible(int(panel.winId())):
-                        panel.show()
-            if self.panels and all(self.shell.panel_is_desktop_child(int(panel.winId())) and
+            elif all(self.shell.panel_is_desktop_child(int(panel.winId())) and
                      (not self.panel_wanted(category) or self.shell.panel_is_visible(int(panel.winId())))
                      for category, panel in self.panels.items()):
                 self.shell.hide_icons(self.organized_paths(self._groups or {}))
@@ -1539,7 +1335,7 @@ class QtOrganizerUI:
             if not self.panel_wanted(category):
                 continue
             x, y, width, height = automatic[category]
-            _set_screen_geometry(panel, x, y, width, height)
+            panel.setGeometry(x, y, width, height)
             profile.setdefault("panel_positions", {})[category] = f"+{x}+{y}"
             profile.setdefault("panel_sizes", {})[category] = {"width": width, "height": height}
         profile["auto_layout"] = False
@@ -1558,7 +1354,7 @@ class QtOrganizerUI:
         base_x, base_y = self.bound_position(wanted_x, wanted_y, width, height)
         monitor = self.shell.target_monitor(self.model.store.data["ui"].get("target_monitor", "primary"))
         occupied = [
-            (_screen_geometry(panel).x(), _screen_geometry(panel).y(), panel.width(), panel.height())
+            (panel.x(), panel.y(), panel.width(), panel.height())
             for name, panel in self.panels.items()
             if name != category and self.panel_wanted(name)
         ]
@@ -1583,7 +1379,7 @@ class QtOrganizerUI:
         return next(((x, y) for x, y in candidates if free(x, y)), (base_x, base_y))
 
     def can_place_panel(self, candidate: Rect) -> bool:
-        if not can_place_rectangle(candidate, [Rect(name, _screen_geometry(panel).x(), _screen_geometry(panel).y(), panel.width(), panel.height())
+        if not can_place_rectangle(candidate, [Rect(name, panel.x(), panel.y(), panel.width(), panel.height())
                                                for name, panel in self.panels.items() if self.panel_wanted(name)]):
             return False
         monitor = self.shell.target_monitor(self.model.store.data["ui"].get("target_monitor", "primary"))
@@ -1596,11 +1392,11 @@ class QtOrganizerUI:
         panel = self.panels.get(category)
         if not panel:
             return False
-        candidate = Rect(category, _screen_geometry(panel).x(), _screen_geometry(panel).y(), panel.width(), panel.height())
+        candidate = Rect(category, panel.x(), panel.y(), panel.width(), panel.height())
         if not self.can_place_panel(candidate):
             if original is not None:
-                if isinstance(original, QPoint): _move_screen(panel, original)
-                else: _set_screen_geometry(panel, original)
+                if isinstance(original, QPoint): panel.move(original)
+                else: panel.setGeometry(original)
             logger.info("layout.placement rejected category=%s candidate=%s", category, candidate)
             self.shell.keep_panels_above_desktop_backdrop()
             return False
@@ -1609,7 +1405,7 @@ class QtOrganizerUI:
             monitor = self.shell.target_monitor(self.model.store.data["ui"].get("target_monitor", "primary"))
             profile = self.layout_profile(monitor)
         profile["auto_layout"] = False
-        profile.setdefault("panel_positions", {})[category] = f"+{_screen_geometry(panel).x()}+{_screen_geometry(panel).y()}"
+        profile.setdefault("panel_positions", {})[category] = f"+{panel.x()}+{panel.y()}"
         profile.setdefault("panel_sizes", {})[category] = {
             "width": panel.width(),
             "height": panel.height(),
@@ -1622,7 +1418,7 @@ class QtOrganizerUI:
     def resolve_geometry_conflicts(self, anchor: str) -> None:
         for _ in range(max(1, len(self.panels) * 2)):
             rects = {
-                name: Rect(name, _screen_geometry(panel).x(), _screen_geometry(panel).y(), panel.width(), panel.height())
+                name: Rect(name, panel.x(), panel.y(), panel.width(), panel.height())
                 for name, panel in self.panels.items()
             }
             conflict: tuple[str, str] | None = None
@@ -1639,24 +1435,24 @@ class QtOrganizerUI:
             first, second = conflict
             victim = second if first == anchor else first if second == anchor else second
             panel = self.panels[victim]
-            x, y = self.safe_position(victim, _screen_geometry(panel).x(), _screen_geometry(panel).y(), panel.width(), panel.height())
-            if (x, y) == (_screen_geometry(panel).x(), _screen_geometry(panel).y()):
+            x, y = self.safe_position(victim, panel.x(), panel.y(), panel.width(), panel.height())
+            if (x, y) == (panel.x(), panel.y()):
                 return
-            _move_screen(panel, QPoint(x, y))
+            panel.move(x, y)
             self.active_profile.setdefault("panel_positions", {})[victim] = f"+{x}+{y}"
 
     def move_panel(self, category: str, x: int, y: int) -> None:
         panel = self.panels.get(category)
         if not panel:
             return
-        original = _screen_geometry(panel).topLeft()
+        original = panel.pos()
         x, y = self.bound_position(x, y, panel.width(), panel.height())
-        _move_screen(panel, QPoint(x, y))
+        panel.move(x, y)
         self.finish_panel_geometry(category, original)
 
     def panel_at(self, point: QPoint) -> str | None:
         for category, panel in self.panels.items():
-            if self.panel_wanted(category) and _screen_geometry(panel).contains(point):
+            if self.panel_wanted(category) and panel.geometry().contains(point):
                 return category
         return None
 
@@ -2096,7 +1892,7 @@ class QtOrganizerUI:
             rect = automatic.get(category)
             if rect is not None:
                 x, y, width, height = rect
-                _set_screen_geometry(panel, x, y, width, height)
+                panel.setGeometry(x, y, width, height)
         self.shell.keep_panels_above_desktop_backdrop()
 
     def _release_settings_topmost(self, dialog: QDialog) -> None:
