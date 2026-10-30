@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QDialogButtonBox
 from desktop_focus import DoubleClickTracker, DesktopClickWatcher
 from smart_desktop import Store
 from test_qt_incremental import Fixture
+import qt_desktop
 import test_window_layout
 
 
@@ -295,8 +296,40 @@ class FavoriteTests(unittest.TestCase):
         shell.keep_panels_above_desktop_backdrop()
         shell.user32.ShowWindow.assert_not_called()
         shell.hidden_panel_windows.clear()
-        shell.keep_panels_above_desktop_backdrop()
-        shell.user32.ShowWindow.assert_called_once_with(101, 4)
+        # The structural fix keeps the maintenance tick read-only: it reports
+        # that Qt must restore visibility instead of re-inserting the block
+        # into the global Z order.
+        self.assertTrue(shell.keep_panels_above_desktop_backdrop())
+        shell.user32.ShowWindow.assert_not_called()
+        shell.user32.SetWindowPos.assert_not_called()
+
+    def test_tick_restores_guard_hidden_child_through_Qt_only(self):
+        ui, shell = self.ui, self.ui.shell
+        panel = ui.panels["a"]
+        hwnd = int(panel.winId())
+        shell.keep_panels_above_desktop_backdrop = lambda: True
+        shell.desktop_available = True
+        shell.panel_windows = {int(p.winId()): int(p.winId()) for p in ui.panels.values()}
+        shell.panel_is_visible = lambda handle: handle != hwnd
+        shown = []
+        panel.show = lambda: shown.append(int(panel.winId()))
+        ui.tick()
+        self.assertEqual(shown, [hwnd])
+
+    def test_render_fail_closed_is_logged_once_without_window_titles(self):
+        ui = self.ui
+        ui.shell.desktop_host_is_safe = lambda: False
+        with patch.object(qt_desktop.logger, "warning") as warning:
+            ui.render()
+            ui.render()
+        fail_closed = [call for call in warning.call_args_list if "fail_closed" in call.args[0]]
+        self.assertEqual(len(fail_closed), 1)
+        message, host, reason = fail_closed[0].args
+        self.assertEqual(host, 1)  # host handle only, never a window title
+        self.assertEqual(reason, "host_band_or_identity_unsafe")
+        self.assertEqual(message.count("%s"), 2)
+        self.assertEqual(ui.panels, {})
+        self.assertEqual(self.fixture.saved, self.initial_saved)
 
 
 if __name__ == "__main__":

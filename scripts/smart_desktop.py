@@ -1374,9 +1374,19 @@ class DesktopShell:
         self.user32 = ctypes.windll.user32
         self.kernel32 = ctypes.windll.kernel32
         self.listview = self._find_listview()
+        self.desktop_view = 0
         self.host = self._find_overlay_host()
         self.hidden = False
         self.panel_windows: dict[int, int] = {}
+        # Fail closed: nothing is advertised as safely attached until the tick
+        # has proven the host band and the child styles.
+        self.desktop_available = False
+        self.hidden_panel_windows: set[int] = set()
+        self.renderer_error = ""
+        self.qt_required = False
+        self._rejected_host: int | None = None
+        self._unsafe_host_state: tuple[int, int, str] | None = None
+        self._host_fail_state: tuple[int, str] | None = None
         self.attribute_state: dict[str, int] = self._load_attribute_state()
         self.guard: subprocess.Popen[Any] | None = None
         # Recover a prior forced/crashed session before establishing this one.
@@ -1452,7 +1462,11 @@ class DesktopShell:
         return self.user32.FindWindowExW(defview, 0, "SysListView32", "FolderView") if defview else 0
 
     def _find_overlay_host(self) -> int:
-        """Return Explorer's visible desktop view, never an application top-level."""
+        """Return the Shell root owning DefView, never an arbitrary wallpaper WorkerW.
+
+        Qt foreign HWND wrappers require a real root for reliable global mapping.
+        Our native child is a sibling above DefView, inside the same desktop band.
+        """
         progman = self.user32.FindWindowW("Progman", None)
         if not progman: return 0
         defview = self.user32.FindWindowExW(progman, 0, "SHELLDLL_DefView", None)
@@ -1464,13 +1478,19 @@ class DesktopShell:
                 defview = self.user32.FindWindowExW(worker, 0, "SHELLDLL_DefView", None)
                 if defview: break
         if not defview: return 0
-        # This desktop session has no full-screen WorkerW wallpaper host; its
-        # WorkerW windows are taskbar-sized.  DefView is the only valid desktop
-        # container available for this process.
-        return defview
+        self.desktop_view = defview
+        return self.user32.GetAncestor(defview, 2) or defview
 
     def hide_icons(self, organized_paths: list[str]) -> None:
         """Hide only organized filesystem entries; keep native virtual/new icons."""
+        hidden = getattr(self, "hidden_panel_windows", set())
+        if hasattr(self, "panel_windows") and (not getattr(self, "desktop_available", False)
+                or not self.desktop_host_is_safe() or not self.panel_windows
+                or not all(self.panel_is_desktop_child(hwnd)
+                           and (hwnd in hidden or self.panel_is_visible(hwnd))
+                           for hwnd in self.panel_windows)):
+            self.restore_icons()
+            return
         self.organized_native_paths = list(organized_paths)
         self.listview = self._find_listview()
         if self.listview: self.user32.ShowWindow(self.listview, self.SW_SHOW)
@@ -1503,7 +1523,7 @@ class DesktopShell:
         self._ensure_guard()
 
     def retry_icon_attributes(self) -> None:
-        if self.host and getattr(self, 'attribute_errors', None):
+        if self.host and getattr(self, "desktop_available", False) and getattr(self, 'attribute_errors', None):
             self.hide_icons(self.organized_native_paths)
 
     def restore_icons(self) -> None:
@@ -1565,109 +1585,256 @@ class DesktopShell:
             self.kernel32.CloseHandle(process)
         return labels
 
-    def attach(self, window_id: int) -> bool:
-        """Place a real-alpha desktop popup below normal application windows."""
+    def _window_topology(self, hwnd: int) -> dict[str, Any]:
+        """Diagnostic identifiers only: never capture application titles or paths."""
+        name = ctypes.create_unicode_buffer(256)
+        self.user32.GetClassNameW(hwnd, name, len(name))
+        pid = ctypes.wintypes.DWORD()
+        thread = self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return {"hwnd": hwnd, "class": name.value, "pid": pid.value, "thread": thread,
+                "style": self.user32.GetWindowLongW(hwnd, -16) & 0xFFFFFFFF,
+                "ex_style": self.user32.GetWindowLongW(hwnd, -20) & 0xFFFFFFFF,
+                "parent": self.user32.GetAncestor(hwnd, 1), "get_parent": self.user32.GetParent(hwnd),
+                "owner": self.user32.GetWindow(hwnd, 4),
+                "root": self.user32.GetAncestor(hwnd, 2), "root_owner": self.user32.GetAncestor(hwnd, 3),
+                "previous": self.user32.GetWindow(hwnd, 3), "next": self.user32.GetWindow(hwnd, 2),
+                "visible": bool(self.user32.IsWindowVisible(hwnd))}
+
+    def trace_window_topology(self, phase: str, panel: int = 0) -> None:
+        if not logger.isEnabledFor(10): return
+        chain: list[dict[str, Any]] = []
+        current = self.user32.GetTopWindow(0)
+        seen: set[int] = set()
+        while isinstance(current, int) and current and current not in seen and len(chain) < 256:
+            seen.add(current)
+            if self.user32.IsWindowVisible(current): chain.append(self._window_topology(current))
+            current = self.user32.GetWindow(current, 2)  # GW_HWNDNEXT, top to bottom
+        logger.debug("desktop.topology %s", json.dumps({"phase": phase, "panel": panel,
+            "panel_topology": self._window_topology(panel) if panel else None,
+            "host_topology": self._window_topology(self.host) if self.host else None,
+            "host": self.host, "foreground": self.user32.GetForegroundWindow(), "top_to_bottom": chain},
+            ensure_ascii=False))
+
+    def _is_own_panel_hwnd(self, hwnd: int) -> bool:
+        if not self.user32.IsWindow(hwnd): return False
+        pid = ctypes.wintypes.DWORD()
+        self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return pid.value == os.getpid()
+
+    def _host_identity_valid(self) -> bool:
         if not self.host: return False
-        # Tk's winfo_id is its client child.  Re-parenting that child leaves the
-        # enclosing TkTopLevel unaffected, so take its real root.
-        outer_window = self.user32.GetAncestor(window_id, 2) or window_id  # GA_ROOT
-        # DefView can itself be a top-level desktop window (or live below a
-        # WorkerW).  Its root is the stable owner; GetParent(DefView) is not.
-        desktop_owner = self.user32.GetAncestor(self.host, 2) or self.host  # GA_ROOT
-        if not desktop_owner: return False
-        set_owner = getattr(self.user32, "SetWindowLongPtrW", self.user32.SetWindowLongW)
-        set_owner.restype = ctypes.c_ssize_t
-        set_owner(outer_window, -8, desktop_owner)  # GWLP_HWNDPARENT / owner
-        style = self.user32.GetWindowLongW(outer_window, -16) & 0xFFFFFFFF
-        popup_style = (style & ~0x40000000) | 0x80000000  # WS_CHILD -> WS_POPUP
-        if popup_style >= 0x80000000: popup_style -= 0x100000000
-        self.user32.SetWindowLongW(outer_window, -16, popup_style)
-        # A desktop block accepts pointer input but must never become the
-        # foreground top-level window.  Without WS_EX_NOACTIVATE, clicking a
-        # title bar to drag it promotes the popup above the user's editor or
-        # browser until the next maintenance tick.
-        ex_style = self.user32.GetWindowLongW(outer_window, -20) & 0xFFFFFFFF
-        if ex_style & 0x00000008:
-            self.user32.SetWindowPos(outer_window, -2, 0, 0, 0, 0, 0x0003 | 0x0010 | 0x0200)
-        no_activate_style = (ex_style | 0x08000000) & ~0x00000008  # NOACTIVATE, never TOPMOST
-        if no_activate_style >= 0x80000000: no_activate_style -= 0x100000000
-        self.user32.SetWindowLongW(outer_window, -20, no_activate_style)
-        # `-alpha` intentionally leaves WS_EX_LAYERED on.  Unlike a layered
-        # child of DefView, this popup is composed by DWM and remains truly
-        # translucent.  Insert directly above the desktop owner's z-band.
-        self.user32.SetWindowPos(outer_window, desktop_owner, 0, 0, 0, 0, 0x0003 | 0x0010 | 0x0020 | 0x0200)
-        if self.user32.GetWindow(outer_window, 4) != desktop_owner:
-            logger.error("desktop.attach failed hwnd=%s owner=%s expected=%s", outer_window,
-                         self.user32.GetWindow(outer_window, 4), desktop_owner)
-            return False  # GW_OWNER
-        self.panel_windows[window_id] = outer_window
-        logger.debug("desktop.attach hwnd=%s host=%s owner=%s", outer_window, self.host, desktop_owner)
+        root = self.user32.GetAncestor(self.host, 2) or self.host
+        if root != self.host: return False
+        view = self.user32.FindWindowExW(root, 0, "SHELLDLL_DefView", None)
+        if not view: return False
+        shell_window = self.user32.GetShellWindow()
+        if not shell_window: return False
+        pids = []
+        for hwnd in (shell_window, root, view):
+            pid = ctypes.wintypes.DWORD()
+            self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            pids.append(pid.value)
+        host_name, root_name = ctypes.create_unicode_buffer(256), ctypes.create_unicode_buffer(256)
+        self.user32.GetClassNameW(view, host_name, len(host_name))
+        self.user32.GetClassNameW(root, root_name, len(root_name))
+        return bool(pids[0] and len(set(pids)) == 1 and host_name.value == "SHELLDLL_DefView"
+                    and root_name.value in {"Progman", "WorkerW"})
+
+    def _window_is_presented(self, hwnd: int) -> bool:
+        if not self.user32.IsWindowVisible(hwnd) or self.user32.IsIconic(hwnd): return False
+        rect = ctypes.wintypes.RECT()
+        if not self.user32.GetWindowRect(hwnd, ctypes.byref(rect)) or rect.right <= rect.left or rect.bottom <= rect.top:
+            return False
+        try:
+            cloaked = ctypes.wintypes.DWORD()
+            result = ctypes.windll.dwmapi.DwmGetWindowAttribute(ctypes.c_void_p(hwnd), 14,
+                       ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+            if result == 0 and cloaked.value: return False
+        except (AttributeError, OSError):
+            pass
+        return True
+
+    def native_child_preflight(self, window_id: int) -> bool:
+        if not self._is_own_panel_hwnd(window_id) or not self.desktop_host_is_safe(): return False
+        try:
+            get_context = self.user32.GetWindowDpiAwarenessContext
+            get_context.restype = ctypes.c_void_p
+            child_context = get_context(ctypes.c_void_p(window_id))
+            host_context = get_context(ctypes.c_void_p(self.host))
+            equal = self.user32.AreDpiAwarenessContextsEqual(ctypes.c_void_p(child_context), ctypes.c_void_p(host_context))
+            child_dpi = self.user32.GetDpiForWindow(ctypes.c_void_p(window_id))
+            host_dpi = self.user32.GetDpiForWindow(ctypes.c_void_p(self.host))
+            # Equal awareness modes prevent SetParent's forced reset. Different
+            # numeric DPI is valid across monitors; geometry is checked by Qt.
+            compatible = bool(equal)
+            logger.debug("desktop.dpi.preflight panel=%s host=%s panel_context=%s host_context=%s panel_dpi=%s host_dpi=%s compatible=%s",
+                         window_id, self.host, child_context, host_context, child_dpi, host_dpi, compatible)
+        except AttributeError:
+            compatible = False
+        if not compatible:
+            self._rejected_host = self.host
+            self.desktop_available = False
+            self.renderer_error = "桌面与 DESKFLOW 的 DPI 模式不兼容；为避免影响其他窗口，已保留原生桌面图标。"
+            logger.error("desktop.dpi.preflight rejected before cross-process SetParent host=%s", self.host)
+        return compatible
+
+    def desktop_host_is_safe(self) -> bool:
+        """Read the host's actual global band; never move the host or apps.
+
+        This is a read-only validation, not a repair loop: the desktop root must
+        be the bottom-most presented top-level window so that every child of it
+        stays below ordinary application windows by construction.
+        """
+        if not self.host or not self.user32.IsWindow(self.host) or not self._host_identity_valid():
+            self._explain_unsafe_host("host_missing" if not self.host else "host_identity_or_window_invalid")
+            return False
+        if getattr(self, "_rejected_host", None) == self.host:
+            self._explain_unsafe_host("host_rejected_by_preflight")
+            return False
+        root = self.user32.GetAncestor(self.host, 2) or self.host
+        if not self.user32.IsWindowVisible(root):
+            self._explain_unsafe_host("host_root_invisible")
+            return False
+        if self.user32.GetWindowLongW(root, -20) & 0x00000008:
+            self._explain_unsafe_host("host_root_topmost")
+            return False
+        current = self.user32.GetTopWindow(0)
+        seen: set[int] = set()
+        below_host = False
+        desktop_classes = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
+        while current and current not in seen and len(seen) < 4096:
+            seen.add(current)
+            if current == root:
+                below_host = True
+            elif below_host and self._window_is_presented(current):
+                name = ctypes.create_unicode_buffer(256)
+                self.user32.GetClassNameW(current, name, len(name))
+                if name.value not in desktop_classes:
+                    unsafe_state = (root, current, name.value)
+                    if getattr(self, "_unsafe_host_state", None) != unsafe_state:
+                        logger.warning("desktop.host unsafe root=%s lower_window=%s class=%s", *unsafe_state)
+                        self.trace_window_topology("host.unsafe")
+                        self._unsafe_host_state = unsafe_state
+                    return False
+            current = self.user32.GetWindow(current, 2)
+        if below_host:
+            self._unsafe_host_state = None
+            self._host_fail_state = None
+        return below_host
+
+    def _explain_unsafe_host(self, reason: str) -> None:
+        """Fail-closed diagnosis: one warning per distinct (host, reason) pair.
+
+        Never records window titles, class names of applications or file paths.
+        """
+        state = (self.host, reason)
+        if getattr(self, "_host_fail_state", None) == state: return
+        self._host_fail_state = state
+        logger.warning("desktop.host fail_closed host=%s reason=%s native_icons=preserved", self.host, reason)
+
+    def attach(self, window_id: int) -> bool:
+        # The old Tk popup has no structural isolation from application Z order.
+        # Refuse that emergency renderer, rather than hide accessible native icons.
+        self.qt_required = True
+        logger.error("desktop.attach refused unsafe legacy popup; Qt desktop child required")
+        return False
+
+    def attach_native_child(self, window_id: int) -> bool:
+        """Accept only our own already embedded Qt HWND; never GA_ROOT(panel)."""
+        if not self.desktop_host_is_safe():
+            self.desktop_available = False
+            return False
+        if not self._is_own_panel_hwnd(window_id):
+            logger.error("desktop.attach refused foreign hwnd=%s", window_id)
+            return False
+        self.trace_window_topology("child.attach.before", window_id)
+        style = self.user32.GetWindowLongW(window_id, -16) & 0xFFFFFFFF
+        if (not style & 0x40000000 or style & 0x80000000
+                or self.user32.GetAncestor(window_id, 1) != self.host
+                or not self.user32.IsChild(self.host, window_id)):
+            logger.error("desktop.attach not a genuine host child hwnd=%s host=%s style=%s", window_id, self.host, style)
+            return False
+        ex_style = ((self.user32.GetWindowLongW(window_id, -20) & 0xFFFFFFFF) | 0x08000000) & ~0x00000008
+        self.kernel32.SetLastError(0)
+        previous_style = self.user32.SetWindowLongW(window_id, -20, ex_style if ex_style < 0x80000000 else ex_style - 0x100000000)
+        error = self.kernel32.GetLastError() if not previous_style else 0
+        if not previous_style and error:
+            logger.error("desktop.child.style failed hwnd=%s last_error=%s", window_id, error)
+            return False
+        flags = 0x0003 | 0x0010 | 0x0020 | 0x0200
+        positioned = self.user32.SetWindowPos(window_id, 0, 0, 0, 0, 0, flags)  # sibling HWND_TOP only
+        error = self.kernel32.GetLastError() if not positioned else 0
+        logger.debug("desktop.child.position hwnd=%s parent=%s result=%s last_error=%s", window_id, self.host, positioned, error)
+        if not positioned: return False
+        self.panel_windows[window_id] = window_id
+        self.desktop_available = True
+        self.trace_window_topology("child.attach.after", window_id)
         return True
 
     def keep_panels_above_desktop_backdrop(self) -> bool:
-        """Repair Explorer ownership and visibility without rebuilding item widgets.
+        """Validate child ownership/host band; never chase global application Z order.
 
-        Explorer may replace DefView while the machine is idle. A stale owner
-        can leave a live popup invisible (or detached above other applications).
-        Re-discover the host and repair only affected windows on each tick.
+        The desktop block is a native child of the Shell root, so Windows itself
+        keeps it below every application window. Nothing here raises, lowers or
+        re-inserts a panel: the maintenance tick only reports invalid children
+        (Qt recreates them) and leaves visibility restoration to Qt, which keeps
+        the child band instead of re-inserting a top-level popup.
         """
         previous_host = self.host
+        previous_available = getattr(self, "desktop_available", bool(previous_host))
         self.host = self._find_overlay_host()
-        changed = previous_host != self.host
+        available = self.desktop_host_is_safe() if self.host else False
+        changed = previous_host != self.host or available != previous_available
+        self.desktop_available = available
         if changed:
-            logger.warning("desktop.host changed old=%s current=%s panels=%s", previous_host,
-                           self.host, len(self.panel_windows))
-        if not self.host:
+            logger.warning("desktop.host state old=%s current=%s available=%s", previous_host, self.host, available)
+        if not available:
             for window in self.panel_windows.values():
-                if self.user32.IsWindow(window): self.user32.ShowWindow(window, self.SW_HIDE)
-            if previous_host: self.restore_icons()
+                if self._is_own_panel_hwnd(window): self.user32.ShowWindow(window, self.SW_HIDE)
+            if previous_available: self.restore_icons()
             return changed
-        if not self.panel_windows: return changed
-        desktop_owner = self.user32.GetAncestor(self.host, 2) or self.host
-        if not desktop_owner: return changed
-        flags = 0x0003 | 0x0010 | 0x0200  # no move/size/activate/owner-z-order
         for window_id, window in list(self.panel_windows.items()):
-            if not self.user32.IsWindow(window):
-                logger.warning("desktop.window invalid hwnd=%s", window)
+            if not self._is_own_panel_hwnd(window) or not self.panel_is_desktop_child(window_id):
+                logger.warning("desktop.child invalid or detached hwnd=%s host=%s", window, self.host)
+                if self._is_own_panel_hwnd(window): self.user32.ShowWindow(window, self.SW_HIDE)
                 self.panel_windows.pop(window_id, None)
                 self.restore_icons()
-                changed = True
+                changed = True  # Qt recreates only this HWND against its new foreign parent.
                 continue
-            if changed or self.user32.GetWindow(window, 4) != desktop_owner:
-                logger.warning("desktop.owner repair hwnd=%s owner=%s expected=%s", window,
-                               self.user32.GetWindow(window, 4), desktop_owner)
-                if not self.attach(window_id):
-                    self.user32.ShowWindow(window, self.SW_HIDE)
-                    self.restore_icons()
-                    continue
-                changed = True
-            ex_style = self.user32.GetWindowLongW(window, -20) & 0xFFFFFFFF
-            if not ex_style & 0x08000000:
-                logger.warning("desktop.noactivate restored hwnd=%s", window)
-                style = ex_style | 0x08000000
-                self.user32.SetWindowLongW(window, -20, style if style < 0x80000000 else style - 0x100000000)
-            if ex_style & 0x00000008:  # WS_EX_TOPMOST survives some native drag loops
-                logger.warning("desktop.topmost cleared hwnd=%s", window)
-                self.user32.SetWindowPos(window, -2, 0, 0, 0, 0, flags)  # HWND_NOTOPMOST
             if window_id in getattr(self, "hidden_panel_windows", set()):
+                # Favorite focus intentionally hides this block; the guard must
+                # not re-show it and must not spend a Z-order repair on it.
                 if self.user32.IsWindowVisible(window): self.user32.ShowWindow(window, self.SW_HIDE)
                 continue
             if not self.user32.IsWindowVisible(window):
-                logger.warning("desktop.visibility restored hwnd=%s", window)
-                self.user32.ShowWindow(window, 4)  # SW_SHOWNOACTIVATE
-                changed = True
-            self.user32.SetWindowPos(window, desktop_owner, 0, 0, 0, 0, flags)
+                changed = True  # Qt's QWindow.setVisible restores logical/expose state too.
         return changed
 
     def panel_is_desktop_child(self, window_id: int) -> bool:
-        outer_window = self.panel_windows.get(window_id)
-        desktop_owner = (self.user32.GetAncestor(self.host, 2) or self.host) if self.host else 0
-        return bool(outer_window and desktop_owner and self.user32.GetWindow(outer_window, 4) == desktop_owner)
+        window = self.panel_windows.get(window_id)
+        if not window or not self.host or not self._is_own_panel_hwnd(window): return False
+        style = self.user32.GetWindowLongW(window, -16) & 0xFFFFFFFF
+        return bool(style & 0x40000000 and not style & 0x80000000
+                    and self.user32.GetAncestor(window, 1) == self.host
+                    and self.user32.IsChild(self.host, window))
 
     def panel_is_visible(self, window_id: int) -> bool:
         rect = ctypes.wintypes.RECT()
         outer_window = self.panel_windows.get(window_id, window_id)
         return bool(self.user32.IsWindowVisible(outer_window) and self.user32.GetWindowRect(outer_window, ctypes.byref(rect)) and rect.right > rect.left and rect.bottom > rect.top)
+
+    def show_native_child(self, window_id: int) -> bool:
+        """Re-show an already valid child without any Z-order change."""
+        if not self.desktop_host_is_safe() or not self.panel_is_desktop_child(window_id): return False
+        flags = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0040 | 0x0200  # SHOW, NOZORDER/NOACTIVATE/NOOWNERZORDER
+        result = self.user32.SetWindowPos(window_id, 0, 0, 0, 0, 0, flags)
+        if not result:
+            error = self.kernel32.GetLastError()
+            logger.error("desktop.child.restore failed hwnd=%s last_error=%s", window_id, error)
+        return bool(result)
+
+    def hide_native_child(self, window_id: int) -> None:
+        if self._is_own_panel_hwnd(window_id): self.user32.ShowWindow(window_id, self.SW_HIDE)
 
     def monitors(self) -> list[dict[str, Any]]:
         """Return each monitor's usable work area, excluding its taskbar."""
@@ -3096,6 +3263,23 @@ class OrganizerUI:
     def run(self) -> None: self.root.mainloop()
 
 
+def run_without_renderer(desktop_shell: DesktopShell, events: queue.Queue, reason: str) -> None:
+    """Keep the API/lifecycle alive while native icons remain accessible."""
+    logger.error("desktop.renderer unavailable: %s", reason)
+    desktop_shell.restore_icons()
+    dialog_root = None
+    try:
+        dialog_root = tk.Tk()
+        dialog_root.withdraw()
+        messagebox.showerror("DESKFLOW 整理层不可用", reason + "\n已恢复原生桌面图标；整理服务仍可使用。", parent=dialog_root)
+    except tk.TclError:
+        logger.exception("desktop.renderer error_dialog unavailable")
+    finally:
+        if dialog_root is not None: dialog_root.destroy()
+    while events.get().get("type") != "close":
+        pass
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(); parser.add_argument("--headless", action="store_true")
     parser.add_argument("--log-level", choices=("debug", "info", "warn", "error"))
@@ -3130,13 +3314,18 @@ def main() -> None:
     if args.headless:
         print(json.dumps({"service": "http://127.0.0.1:8765", "categories": model.scan()}, ensure_ascii=False)); threading.Event().wait()
     else:
-        # Qt paints the plate and content at different alpha values.  Keep the
-        # mature Tk renderer available only as an explicit emergency rollback;
-        # it cannot satisfy independent background/content transparency.
+        # Unsafe legacy popups are no longer a renderer fallback. Missing Qt
+        # keeps native icons and the API alive without restarting the overlay.
+        desktop_shell = DesktopShell()
         if os.environ.get("DESKFLOW_UI", "qt").casefold() == "tk":
-            OrganizerUI(model, events).run()
+            run_without_renderer(desktop_shell, events, "旧 Tk 浮层无法保证处于应用窗口下方，已停止该展示模式。请使用 Qt 展示层。")
         else:
-            from qt_desktop import QtOrganizerUI
-            QtOrganizerUI(model, events, DesktopShell(), all_categories).run()
+            try:
+                from qt_desktop import QtOrganizerUI
+            except (ImportError, OSError):
+                logger.exception("desktop.qt import failed")
+                run_without_renderer(desktop_shell, events, "Qt 展示依赖无法加载，请修复安装后重启 DESKFLOW。")
+            else:
+                QtOrganizerUI(model, events, desktop_shell, all_categories).run()
 
 if __name__ == "__main__": main()
