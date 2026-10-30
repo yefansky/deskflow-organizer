@@ -125,6 +125,125 @@ class FavoriteTests(unittest.TestCase):
         ui.toggle_favorite_focus()
         self.assertEqual(ui.panels["a"].geometry(), focused)
 
+    def test_display_recovery_preserves_saved_focus_and_normal_layout(self):
+        ui = self.ui
+        ui.toggle_favorite("a")
+        normal = {key: p.geometry() for key, p in ui.panels.items()}
+        ui.toggle_favorite_focus()
+        ui.panels["a"].move(400, 400)
+        self.assertTrue(ui.finish_panel_geometry("a"))
+        focused = ui.panels["a"].geometry()
+        before = deepcopy(self.fixture.data["ui"]["layout_profiles"])
+        monitor = {"left": 0, "top": 0, "right": 1920, "bottom": 500,
+                   "screen_left": 0, "screen_top": 0, "screen_right": 1920, "screen_bottom": 1080}
+        ui.shell.target_monitor = lambda _target: monitor
+        ui.tick()
+        self.assertEqual(self.fixture.data["ui"]["layout_profiles"], before)
+        self.assertLessEqual(ui.panels["a"].geometry().bottom(), 492)
+        monitor["bottom"] = 1080
+        ui.tick()
+        self.assertEqual(ui.panels["a"].geometry(), focused)
+        self.assertEqual(self.fixture.data["ui"]["layout_profiles"], before)
+        ui.toggle_favorite_focus()
+        self.assertEqual({key: p.geometry() for key, p in ui.panels.items()}, normal)
+
+    def test_temporary_bounds_toggle_keeps_saved_focus_and_manual_move_updates_it(self):
+        ui = self.ui
+        ui.toggle_favorite("a")
+        ui.toggle_favorite_focus()
+        ui.panels["a"].move(400, 600)
+        self.assertTrue(ui.finish_panel_geometry("a"))
+        before = deepcopy(self.fixture.data["ui"]["layout_profiles"])
+        ui.toggle_favorite_focus()
+        monitor = {"left": 0, "top": 0, "right": 1920, "bottom": 500,
+                   "screen_left": 0, "screen_top": 0, "screen_right": 1920, "screen_bottom": 1080}
+        ui.shell.target_monitor = lambda _target: monitor
+        ui.tick()
+        ui.toggle_favorite_focus()
+        self.assertEqual(self.fixture.data["ui"]["layout_profiles"], before)
+        ui.panels["a"].move(500, 100)
+        self.assertTrue(ui.finish_panel_geometry("a"))
+        profile = next(iter(self.fixture.data["ui"]["layout_profiles"].values()))
+        self.assertEqual(profile["mode_layouts"]["favorites"]["panel_positions"]["a"], "+500+100")
+        monitor["bottom"] = 1080
+        ui.tick()
+        self.assertEqual((ui.panels["a"].x(), ui.panels["a"].y()), (500, 100))
+
+    def test_explicit_arrange_still_saves_during_display_recovery(self):
+        ui = self.ui
+        ui.toggle_favorite("a")
+        ui.toggle_favorite_focus()
+        ui.panels["a"].move(400, 400)
+        self.assertTrue(ui.finish_panel_geometry("a"))
+        monitor = {"left": 0, "top": 0, "right": 1920, "bottom": 800,
+                   "screen_left": 0, "screen_top": 0, "screen_right": 1920, "screen_bottom": 1080}
+        ui.shell.target_monitor = lambda _target: monitor
+        ui.events.put({"type": "arrange"})
+        ui.tick()
+        profile = next(iter(self.fixture.data["ui"]["layout_profiles"].values()))
+        self.assertNotEqual(profile["mode_layouts"]["favorites"]["panel_positions"]["a"], "+400+400")
+
+    def test_saved_focus_layout_survives_store_reload(self):
+        ui = self.ui
+        ui.toggle_favorite("a")
+        ui.toggle_favorite_focus()
+        ui.panels["a"].move(400, 400)
+        self.assertTrue(ui.finish_panel_geometry("a"))
+        expected = ui.panels["a"].geometry()
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "layout.json"
+            with patch("smart_desktop.DATA_DIR", Path(directory)), patch("smart_desktop.CONFIG_PATH", config):
+                store = Store()
+                store.data.update(deepcopy(self.fixture.data))
+                store.save()
+                loaded = Store()
+                ui.model.store.data = loaded.data
+                ui.focus_favorites = False
+                ui._destroy_all()
+                ui.render()
+                ui.toggle_favorite_focus()
+                self.assertEqual(ui.panels["a"].geometry(), expected)
+
+    def test_switch_to_normal_in_temporary_bounds_is_visible_without_overwriting(self):
+        ui = self.ui
+        ui.panels["a"].move(400, 600)
+        self.assertTrue(ui.finish_panel_geometry("a"))
+        normal = ui.panels["a"].geometry()
+        ui.toggle_favorite("a")
+        ui.toggle_favorite_focus()
+        before = deepcopy(self.fixture.data["ui"]["layout_profiles"])
+        monitor = {"left": 0, "top": 0, "right": 1920, "bottom": 500,
+                   "screen_left": 0, "screen_top": 0, "screen_right": 1920, "screen_bottom": 1080}
+        ui.shell.target_monitor = lambda _target: monitor
+        ui.tick()
+        ui.toggle_favorite_focus()
+        self.assertLessEqual(ui.panels["a"].geometry().bottom(), 492)
+        self.assertEqual(self.fixture.data["ui"]["layout_profiles"], before)
+        monitor["bottom"] = 1080
+        ui.tick()
+        self.assertEqual(ui.panels["a"].geometry(), normal)
+        self.assertEqual(self.fixture.data["ui"]["layout_profiles"], before)
+
+    def test_single_panel_rebuild_in_temporary_bounds_stays_visible(self):
+        ui = self.ui
+        ui.toggle_favorite("a")
+        ui.toggle_favorite_focus()
+        ui.panels["a"].move(400, 600)
+        self.assertTrue(ui.finish_panel_geometry("a"))
+        before = deepcopy(self.fixture.data["ui"]["layout_profiles"])
+        monitor = {"left": 0, "top": 0, "right": 1920, "bottom": 500,
+                   "screen_left": 0, "screen_top": 0, "screen_right": 1920, "screen_bottom": 1080}
+        ui.shell.target_monitor = lambda _target: monitor
+        ui.tick()
+        self.fixture.data["category_modes"]["a"] = "compact"
+        ui.render("a")
+        self.assertLessEqual(ui.panels["a"].geometry().bottom(), 492)
+        self.assertEqual(self.fixture.data["ui"]["layout_profiles"], before)
+        monitor["bottom"] = 1080
+        ui.tick()
+        self.assertEqual((ui.panels["a"].x(), ui.panels["a"].y()), (400, 600))
+        self.assertEqual(self.fixture.data["ui"]["layout_profiles"], before)
+
     def test_focus_collision_rejects_without_changing_normal_layout(self):
         ui = self.ui
         ui.toggle_favorite("a")

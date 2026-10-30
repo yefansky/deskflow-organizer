@@ -760,18 +760,16 @@ class QtOrganizerUI:
                 width, height = int(size.get("width", width)), int(size.get("height", height))
                 x, y = self._position_from_saved(profile.get("panel_positions", {}).get(category, ""), (x, y))
             panel.setGeometry(x, y, width, height)
-        if self.focus_favorites:
-            requested = [Rect(category, panel.x(), panel.y(), panel.width(), panel.height())
-                         for category, panel in self.panels.items() if self.panel_wanted(category)]
-            bounds = (monitor["left"], monitor["top"], monitor["right"], monitor["bottom"])
-            repaired = restore_rectangles(requested, bounds, margin=8)
-            if any(repaired[item.key] != item for item in requested):
-                for category, rect in repaired.items():
-                    self.panels[category].setGeometry(rect.x, rect.y, rect.width, rect.height)
-                    profile.setdefault("panel_positions", {})[category] = f"+{rect.x}+{rect.y}"
-                    profile.setdefault("panel_sizes", {})[category] = {"width": rect.width, "height": rect.height}
-                if not self._settings_preview:
-                    self.model.store.save()
+        requested = [Rect(category, panel.x(), panel.y(), panel.width(), panel.height())
+                     for category, panel in self.panels.items() if self.panel_wanted(category)]
+        bounds = (monitor["left"], monitor["top"], monitor["right"], monitor["bottom"])
+        repaired = restore_rectangles(requested, bounds, margin=8)
+        for item in requested:
+            rect = repaired[item.key]
+            if rect != item:
+                self.panels[item.key].setGeometry(rect.x, rect.y, rect.width, rect.height)
+        # Screen/work-area changes can be temporary.  Keep these visibility
+        # corrections transient until the user moves a panel.
         self.apply_favorite_visibility()
         logger.info("desktop.favorite_focus enabled=%s", self.focus_favorites)
 
@@ -1076,7 +1074,7 @@ class QtOrganizerUI:
             return
         self.apply_favorite_visibility()
         self.shell.keep_panels_above_desktop_backdrop()
-        if only is None and (structural_change or display_changed):
+        if structural_change or display_changed:
             bounds = (monitor["left"], monitor["top"], monitor["right"], monitor["bottom"])
             requested = [
                 Rect(category, panel.x(), panel.y(), panel.width(), panel.height())
@@ -1093,14 +1091,8 @@ class QtOrganizerUI:
                 rect = packed[category]
                 if (panel.x(), panel.y(), panel.width(), panel.height()) != (rect.x, rect.y, rect.width, rect.height):
                     panel.setGeometry(rect.x, rect.y, rect.width, rect.height)
-            if not use_automatic_layout and not self._settings_preview:
-                corrected = any(rect != requested[index] for index, rect in enumerate(packed.values()))
-                if corrected:
-                    logger.warning("layout.saved_profile repaired bounds=%s", bounds)
-                    for category, rect in packed.items():
-                        profile.setdefault("panel_positions", {})[category] = f"+{rect.x}+{rect.y}"
-                        profile.setdefault("panel_sizes", {})[category] = {"width": rect.width, "height": rect.height}
-                    self.model.store.save()
+            # Packing only makes saved geometry visible on this work area; it
+            # must not overwrite the user's durable positions on reconnect.
         if self.panels and all(
             not self.panel_wanted(category) or self.shell.panel_is_visible(int(panel.winId()))
             for category, panel in self.panels.items()
@@ -1137,6 +1129,7 @@ class QtOrganizerUI:
         rerender = False
         arrange = False
         recovery = False
+        user_arrange = False
         changed: set[str] = set()
         while True:
             try:
@@ -1149,7 +1142,7 @@ class QtOrganizerUI:
                 self.close()
                 return
             if kind == "arrange":
-                arrange = True
+                arrange = user_arrange = True
             elif kind in {"panel-style", "panel-mode"}:
                 self.render(event["category"])
             elif kind == "move":
@@ -1204,7 +1197,10 @@ class QtOrganizerUI:
                 logger.warning("desktop.display_recovery rebuilding_windows bounds=%s", bounds)
                 self.clear_selection()
                 self._destroy_all()
-            self.arrange_top_right(rebuild=rerender or recovery)
+            if recovery and not user_arrange:
+                self.render()
+            else:
+                self.arrange_top_right(rebuild=rerender or recovery)
         elif rerender:
             self.render()
         else:
