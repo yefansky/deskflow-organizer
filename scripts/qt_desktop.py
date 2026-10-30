@@ -66,6 +66,22 @@ PANEL_MODE_LABELS = {
 }
 PANEL_MODE_GLYPHS = {"list": "☷", "compact": "≡", "cards": "▦"}
 
+# A foreign-parented QWindow can change its client size when it is first shown:
+# Qt applies the widget's minimum-size hints and layout size constraints during
+# show, so the post-show height/width can differ from the requested geometry by
+# a few pixels.  Screen coordinates are the part that must map exactly, because
+# a wrong parent/mapping shows up as positional drift (or a size jump far beyond
+# layout adjustments).  Allow a bounded client-size adjustment, fail closed for
+# everything else.
+CHILD_GEOMETRY_SIZE_TOLERANCE = 8
+
+
+def _child_geometry_matches(expected: QRect, actual: QRect) -> bool:
+    """Position must match exactly; size may differ by the show-time tolerance."""
+    if expected.topLeft() != actual.topLeft(): return False
+    return (abs(expected.width() - actual.width()) <= CHILD_GEOMETRY_SIZE_TOLERANCE
+            and abs(expected.height() - actual.height()) <= CHILD_GEOMETRY_SIZE_TOLERANCE)
+
 
 def _screen_geometry(panel) -> QRect:
     if hasattr(panel, "screen_geometry"): return panel.screen_geometry()
@@ -548,15 +564,28 @@ class PanelWindow(QWidget):
         if not shell.attach_native_child(int(self.winId())): return False
         self._registered_hwnd = int(self.winId())
         self.show()
+        return self._confirm_child_geometry(geometry) and shell.panel_is_desktop_child(int(self.winId())) and shell.desktop_host_is_safe()
+
+    def _confirm_child_geometry(self, expected: QRect) -> bool:
+        """Verify the embedded child landed at the requested screen position.
+
+        show() may legitimately adjust the client size by a few pixels (layout
+        and minimum-size hints), so only the position has to be exact; a size
+        difference beyond CHILD_GEOMETRY_SIZE_TOLERANCE still means the child is
+        not the window we placed, and is treated as a mapping failure.
+        """
         actual = self.screen_geometry()
-        if actual != geometry:
-            logger.error("desktop.child.geometry mismatch expected=%s actual=%s host=%s", geometry, actual, shell.host)
-            shell.hide_native_child(int(self.winId()))
-            shell._rejected_host = shell.host
-            shell.desktop_available = False
-            shell.renderer_error = "桌面窗口坐标映射校验失败，已保留原生桌面图标。请查看诊断日志。"
-            return False
-        return shell.panel_is_desktop_child(int(self.winId())) and shell.desktop_host_is_safe()
+        if _child_geometry_matches(expected, actual):
+            if actual.size() != expected.size():
+                logger.info("desktop.child.size adjusted expected=%s actual=%s", expected, actual)
+            return True
+        logger.error("desktop.child.geometry mismatch expected=%s actual=%s host=%s", expected, actual, self.controller.shell.host)
+        shell = self.controller.shell
+        shell.hide_native_child(int(self.winId()))
+        shell._rejected_host = shell.host
+        shell.desktop_available = False
+        shell.renderer_error = "桌面窗口坐标映射校验失败，已保留原生桌面图标。请查看诊断日志。"
+        return False
 
     def setVisible(self, visible: bool) -> None:  # type: ignore[override]
         if getattr(self, "_desktop_parent", None) is not None:

@@ -11,7 +11,8 @@ from unittest.mock import Mock, patch
 from PySide6.QtCore import QPoint, QRect
 from PySide6.QtGui import QIcon, QPixmap, QColor, QFontDatabase
 from PySide6.QtWidgets import QApplication, QMessageBox
-from qt_desktop import QtOrganizerUI, PanelWindow, HeaderButton
+from qt_desktop import (QtOrganizerUI, PanelWindow, HeaderButton, CHILD_GEOMETRY_SIZE_TOLERANCE,
+                        _child_geometry_matches)
 
 
 class QtInteractionTests(unittest.TestCase):
@@ -373,6 +374,63 @@ class WinIdRebuildTests(unittest.TestCase):
         shell.restore_icons.assert_called_once()
         self.assertIsNone(panel._appearance)
         self.assertEqual(panel.controller.events.get_nowait(), {"type": "render"})
+
+
+class ChildGeometryTests(unittest.TestCase):
+    """Real-desktop evidence: show() adjusted the child height 86 -> 91 at the
+    exact same origin, which used to fail the whole layer closed."""
+
+    EXPECTED = QRect(2246, 531, 304, 86)  # synthetic, matches the reported shape
+
+    def make_panel(self, actual):
+        shell = SimpleNamespace(host=131620, hide_native_child=Mock(),
+                                desktop_available=True, renderer_error="")
+        panel = SimpleNamespace(controller=SimpleNamespace(shell=shell),
+                                screen_geometry=lambda: QRect(actual),
+                                winId=lambda: 4242)
+        return panel, shell
+
+    def test_show_time_height_growth_is_accepted(self):
+        panel, shell = self.make_panel(QRect(2246, 531, 304, 91))  # +5 height
+        self.assertTrue(PanelWindow._confirm_child_geometry(panel, self.EXPECTED))
+        shell.hide_native_child.assert_not_called()
+        self.assertTrue(shell.desktop_available)
+        self.assertFalse(hasattr(shell, "_rejected_host"))
+        self.assertEqual(shell.renderer_error, "")
+
+    def test_show_time_width_growth_is_accepted(self):
+        panel, shell = self.make_panel(QRect(2246, 531, 309, 91))  # +5 width, +5 height
+        self.assertTrue(PanelWindow._confirm_child_geometry(panel, self.EXPECTED))
+        shell.hide_native_child.assert_not_called()
+        self.assertTrue(shell.desktop_available)
+
+    def test_position_drift_still_fails_closed(self):
+        panel, shell = self.make_panel(QRect(2247, 531, 304, 86))
+        self.assertFalse(PanelWindow._confirm_child_geometry(panel, self.EXPECTED))
+        shell.hide_native_child.assert_called_once_with(4242)
+        self.assertFalse(shell.desktop_available)
+        self.assertEqual(shell._rejected_host, 131620)
+        self.assertIn("坐标", shell.renderer_error)
+
+    def test_size_deviation_beyond_tolerance_fails_closed(self):
+        panel, shell = self.make_panel(QRect(2246, 531, 304, 95))  # +9 height
+        self.assertFalse(PanelWindow._confirm_child_geometry(panel, self.EXPECTED))
+        shell.hide_native_child.assert_called_once_with(4242)
+        self.assertFalse(shell.desktop_available)
+
+    def test_tolerance_boundary_is_inclusive(self):
+        for width, height, accepted in ((312, 94, True), (313, 94, False),
+                                        (312, 95, False), (296, 78, True), (295, 78, False)):
+            panel, shell = self.make_panel(QRect(2246, 531, width, height))
+            self.assertEqual(PanelWindow._confirm_child_geometry(panel, self.EXPECTED), accepted,
+                             f"width={width} height={height}")
+            if accepted:
+                shell.hide_native_child.assert_not_called()
+            else:
+                shell.hide_native_child.assert_called_once_with(4242)
+        self.assertEqual(CHILD_GEOMETRY_SIZE_TOLERANCE, 8)
+        self.assertTrue(_child_geometry_matches(self.EXPECTED, QRect(2246, 531, 312, 94)))
+        self.assertFalse(_child_geometry_matches(self.EXPECTED, QRect(2246, 531, 313, 94)))
 
 
 if __name__ == "__main__":
