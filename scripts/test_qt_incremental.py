@@ -44,7 +44,7 @@ class Fixture:
         shell.retry_icon_attributes = lambda: None
         shell.monitors = lambda: []
         shell.remember_target_monitor = lambda ui, target: ui.update(target_monitor=target)
-        with patch("qt_desktop.DesktopClickWatcher", return_value=Mock(poll=lambda: 0)):
+        with patch("qt_desktop.DesktopClickWatcher", return_value=Mock(poll=lambda *_: 0)):
             self.ui = ui_type(model, queue.Queue(), shell, lambda _store: self.categories)
 
     def close(self):

@@ -53,6 +53,8 @@ class DesktopClickWatcher:
         self.user.WindowFromPoint.restype = w.HWND
         self.user.GetParent.argtypes = [w.HWND]
         self.user.GetParent.restype = w.HWND
+        self.user.GetWindowRect.argtypes = [w.HWND, ctypes.POINTER(w.RECT)]
+        self.user.IsWindow.argtypes = [w.HWND]
         self.user.GetClassNameW.argtypes = [w.HWND, w.LPWSTR, ctypes.c_int]
         self.user.GetWindowThreadProcessId.argtypes = [w.HWND, ctypes.POINTER(w.DWORD)]
         self.user.ScreenToClient.argtypes = [w.HWND, ctypes.POINTER(w.POINT)]
@@ -85,8 +87,7 @@ class DesktopClickWatcher:
     def blank_at(self, x: int, y: int, hwnd: int) -> bool:
         # Check the window captured at the input event, and fail closed on any
         # denied/timeout hit test. Selected icons elsewhere do not imply a hit.
-        if self._class_name(hwnd) != "SysListView32" or \
-                self._class_name(self.user.GetParent(hwnd)) != "SHELLDLL_DefView":
+        if not self.is_desktop_list(hwnd):
             return False
         point = w.POINT(x, y)
         if not self.user.ScreenToClient(hwnd, ctypes.byref(point)):
@@ -119,6 +120,10 @@ class DesktopClickWatcher:
             if remote:
                 self.kernel.VirtualFreeEx(process, remote, 0, 0x8000)
             self.kernel.CloseHandle(process)
+
+    def is_desktop_list(self, hwnd: int) -> bool:
+        return (self._class_name(hwnd) == "SysListView32" and
+                self._class_name(self.user.GetParent(hwnd)) == "SHELLDLL_DefView")
 
     def _listen(self):
         hook = None
@@ -154,7 +159,7 @@ class DesktopClickWatcher:
                     elif message == 0x0200 and pressed and (abs(x - pressed[0]) > self.tracker.drag_x or
                                                            abs(y - pressed[1]) > self.tracker.drag_y):
                         pressed = None
-                        kind = "cancel"
+                        kind = "drag"
                     elif message in (0x0204, 0x0207):  # right/middle interrupts a pair
                         pressed = None
                         kind = "cancel"
@@ -180,13 +185,24 @@ class DesktopClickWatcher:
             if hook:
                 self.user.UnhookWindowsHookEx(hook)
 
-    def poll(self) -> int:
+    def poll(self, observer=None) -> int:
         toggles = 0
         while not self.events.empty():
             kind, x, y, timestamp, hwnd = self.events.get_nowait()
-            blank = kind != "cancel" and self.blank_at(x, y, hwnd)
-            toggles += self.tracker.feed(kind, x, y, timestamp, blank)
+            blank = kind not in ("cancel", "drag") and self.blank_at(x, y, hwnd)
+            toggles += self.tracker.feed("cancel" if kind == "drag" else kind, x, y, timestamp, blank)
+            if observer is not None:
+                observer(kind, x, y, hwnd, blank)
         return toggles
+
+    def window_rect(self, hwnd: int):
+        rect = w.RECT()
+        if not self.user.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        return rect.left, rect.top, rect.right, rect.bottom
+
+    def listener_alive(self) -> bool:
+        return self.thread.is_alive()
 
     def close(self):
         self.stopping.set()

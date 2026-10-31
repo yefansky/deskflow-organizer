@@ -91,6 +91,7 @@ class HeaderBar(QWidget):
         self.panel = panel
         self._start_global: QPoint | None = None
         self._start_panel: QPoint | None = None
+        self._group_original: dict[str, QPoint] | None = None
         _set_transparent(self)
         self.setFixedHeight(31)
 
@@ -98,6 +99,11 @@ class HeaderBar(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self._start_global = event.globalPosition().toPoint()
             self._start_panel = self.panel.pos()
+            controller = self.panel.controller
+            if self.panel.category.id not in controller.selected_panels:
+                controller.set_selected_panels(set())
+            self._group_original = {name: QPoint(controller.panels[name].pos()) for name in controller.selected_panels
+                                    if name in controller.panels and controller.panel_wanted(name)}
             self.panel.controller.shell.keep_panels_above_desktop_backdrop()
             event.accept()
             return
@@ -110,6 +116,16 @@ class HeaderBar(QWidget):
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
         if self._start_global is not None and self._start_panel is not None:
             delta = event.globalPosition().toPoint() - self._start_global
+            if len(self._group_original or {}) > 1:
+                for name, pos in self._group_original.items():
+                    panel = self.panel.controller.panels.get(name)
+                    if panel is not None:
+                        panel.move(pos + delta)
+                valid = self.panel.controller.can_place_group(set(self._group_original))
+                self.setCursor(Qt.CursorShape.SizeAllCursor if valid else Qt.CursorShape.ForbiddenCursor)
+                self.panel.controller.shell.keep_panels_above_desktop_backdrop()
+                event.accept()
+                return
             wanted = self._start_panel + delta
             x, y = self.panel.controller.bound_position(
                 wanted.x(), wanted.y(), self.panel.width(), self.panel.height()
@@ -127,7 +143,11 @@ class HeaderBar(QWidget):
         if self._start_global is not None:
             original = self._start_panel
             self._start_global = self._start_panel = None
-            self.panel.controller.finish_panel_geometry(self.panel.category.id, original)
+            group, self._group_original = self._group_original, None
+            if group and len(group) > 1:
+                self.panel.controller.finish_panel_group(group)
+            else:
+                self.panel.controller.finish_panel_geometry(self.panel.category.id, original)
             self.unsetCursor()
             event.accept()
             return
@@ -611,8 +631,9 @@ class PanelWindow(QWidget):
         plate = QColor(self.panel_background)
         plate.setAlphaF(max(.04, min(.85, self.plate_opacity)))
         painter.fillPath(path, plate)
-        border = QColor(226, 242, 255, 58)
-        painter.setPen(QPen(border, 1.0))
+        selected = self.category.id in getattr(self.controller, "selected_panels", set())
+        border = QColor(78, 180, 255, 245) if selected else QColor(226, 242, 255, 58)
+        painter.setPen(QPen(border, 2.0 if selected else 1.0))
         painter.drawPath(path)
         super().paintEvent(event)
 
@@ -690,6 +711,11 @@ class QtOrganizerUI:
         self.app = QApplication.instance() or QApplication([])
         self.app.setQuitOnLastWindowClosed(False)
         self.panels: dict[str, PanelWindow] = {}
+        self.selected_panels: set[str] = set()
+        self._marquee_start: tuple[int, int, int] | None = None
+        self._marquee_dragged = False
+        self._desktop_press = None
+        self._desktop_press_down = False
         self.focus_favorites = False
         self.selected_item: ItemWidget | None = None
         self.group_snapshot: dict[str, tuple[tuple[str, str, bool], ...]] = {}
@@ -730,9 +756,61 @@ class QtOrganizerUI:
         self.focus_timer.start(20)
 
     def watch_desktop_clicks(self) -> None:
-        for _ in range(self.desktop_clicks.poll()):
+        for _ in range(self.desktop_clicks.poll(self.desktop_pointer_event)):
             if not self._settings_dialog:
                 self.toggle_favorite_focus()
+        if self._marquee_start and self._marquee_dragged:
+            self.update_marquee(*self.shell.cursor_position())
+
+    def set_selected_panels(self, names: set[str]) -> None:
+        names = {name for name in names if name in self.panels and self.panel_wanted(name)}
+        changed = self.selected_panels ^ names
+        self.selected_panels = names
+        for name in changed:
+            if name in self.panels:
+                self.panels[name].update()
+
+    def desktop_pointer_event(self, kind: str, x: int, y: int, hwnd: int, blank: bool) -> None:
+        if kind == "down":
+            self._desktop_press = (x, y, hwnd, blank)
+            self._desktop_press_down = True
+            self._marquee_start = (x, y, hwnd) if blank and not self._settings_dialog else None
+            self._marquee_dragged = False
+            if self._marquee_start:
+                self.set_selected_panels(set())
+        elif kind == "drag" and self._marquee_start:
+            self._marquee_dragged = True
+            self.update_marquee(x, y)
+        elif kind == "up" and self._marquee_start:
+            if self._marquee_dragged:
+                self.update_marquee(x, y)
+            self._marquee_start = None
+            self._marquee_dragged = False
+        elif kind == "cancel":
+            self._marquee_start = None
+            self._marquee_dragged = False
+            self.set_selected_panels(set())
+        if kind == "up":
+            self._desktop_press_down = False
+
+    def update_marquee(self, x: int, y: int) -> None:
+        if not self._marquee_start:
+            return
+        sx, sy, hwnd = self._marquee_start
+        if not self.desktop_clicks.user.IsWindow(hwnd):
+            self._marquee_start = None
+            self.set_selected_panels(set())
+            return
+        left, right = sorted((sx, x))
+        top, bottom = sorted((sy, y))
+        selected = set()
+        for name, panel in self.panels.items():
+            if not self.panel_wanted(name):
+                continue
+            rect = self.desktop_clicks.window_rect(int(panel.winId()))
+            if rect and left < rect[2] and right > rect[0] and top < rect[3] and bottom > rect[1]:
+                selected.add(name)
+        self.set_selected_panels(selected)
 
     def toggle_favorite(self, category: str) -> None:
         with self.model.store.lock:
@@ -747,6 +825,8 @@ class QtOrganizerUI:
 
     def toggle_favorite_focus(self) -> None:
         self.focus_favorites = not getattr(self, "focus_favorites", False)
+        self._marquee_start = None
+        self.set_selected_panels(set())
         self.clear_selection()
         monitor = self.shell.target_monitor(self.model.store.data["ui"].get("target_monitor", "primary"))
         profile = self.layout_profile(monitor)
@@ -777,6 +857,7 @@ class QtOrganizerUI:
         return not getattr(self, "focus_favorites", False) or category in self.model.store.data.get("favorite_categories", [])
 
     def apply_favorite_visibility(self) -> None:
+        self.set_selected_panels(self.selected_panels)
         self.shell.hidden_panel_windows = {int(panel.winId()) for category, panel in self.panels.items()
                                            if not self.panel_wanted(category)}
         for category, panel in self.panels.items():
@@ -1013,6 +1094,7 @@ class QtOrganizerUI:
                         and (category.id not in hidden_empty or groups.get(category.id))}
         for removed in set(self.panels) - category_ids:
             structural_change = True
+            self.selected_panels.discard(removed)
             previous = self.panels.pop(removed)
             if self.selected_item in previous.item_widgets:
                 self.clear_selection()
@@ -1388,6 +1470,44 @@ class QtOrganizerUI:
                 and candidate.x + candidate.width <= monitor["right"] - 8
                 and candidate.y + candidate.height <= monitor["bottom"] - 8)
 
+    def can_place_group(self, names: set[str]) -> bool:
+        monitor = self.shell.target_monitor(self.model.store.data["ui"].get("target_monitor", "primary"))
+        others = [Rect(name, panel.x(), panel.y(), panel.width(), panel.height())
+                  for name, panel in self.panels.items() if name not in names and self.panel_wanted(name)]
+        for name in names:
+            panel = self.panels.get(name)
+            if panel is None or not self.panel_wanted(name):
+                return False
+            rect = Rect(name, panel.x(), panel.y(), panel.width(), panel.height())
+            physical = self.desktop_clicks.window_rect(int(panel.winId()))
+            if not (physical and rect.width > 0 and rect.height > 0 and physical[0] >= monitor["left"] + 8
+                    and physical[1] >= monitor["top"] + 8 and physical[2] <= monitor["right"] - 8
+                    and physical[3] <= monitor["bottom"] - 8
+                    and can_place_rectangle(rect, others)):
+                return False
+        return True
+
+    def finish_panel_group(self, originals: dict[str, QPoint]) -> bool:
+        if not self.can_place_group(set(originals)):
+            for name, pos in originals.items():
+                if name in self.panels:
+                    self.panels[name].move(pos)
+            self.shell.keep_panels_above_desktop_backdrop()
+            return False
+        profile = getattr(self, "active_profile", None)
+        if profile is None:
+            monitor = self.shell.target_monitor(self.model.store.data["ui"].get("target_monitor", "primary"))
+            profile = self.layout_profile(monitor)
+        profile["auto_layout"] = False
+        for name in originals:
+            panel = self.panels[name]
+            profile.setdefault("panel_positions", {})[name] = f"+{panel.x()}+{panel.y()}"
+            profile.setdefault("panel_sizes", {})[name] = {"width": panel.width(), "height": panel.height()}
+        if not self._settings_preview:
+            self.model.store.save()
+        self.shell.keep_panels_above_desktop_backdrop()
+        return True
+
     def finish_panel_geometry(self, category: str, original: Any = None) -> bool:
         panel = self.panels.get(category)
         if not panel:
@@ -1457,6 +1577,7 @@ class QtOrganizerUI:
         return None
 
     def select_item(self, item: ItemWidget) -> None:
+        self.set_selected_panels(set())
         if not isValid(item):
             return
         if self.selected_item and self.selected_item is not item:
@@ -1515,11 +1636,25 @@ class QtOrganizerUI:
             return item["name"] if item["kind"] == "folder" else Path(item["name"]).stem
 
     def watch_native_drag(self) -> None:
+        # Process the actual hook down before sampling mouse state; current
+        # cursor location may already be over a different item or panel.
+        self.watch_desktop_clicks()
         down = self.shell.left_button_down()
         if down and not self.native_mouse_down:
             self.native_drag = None
-            if self.shell.pointer_over_listview():
-                x, y = self.shell.cursor_position()
+            if not self._desktop_press_down or self._desktop_press is None:
+                if self.desktop_clicks.listener_alive():
+                    return  # hook event has not arrived; retry rather than guess
+                # Known failed hook: retain the old sampled native-icon path.
+                # No Deskflow marquee can start without the hook; this fallback
+                # cannot reconstruct the exact original down point.
+                if self.shell.pointer_over_listview():
+                    x, y = self.shell.cursor_position()
+                    self.native_drag = {"x": x, "y": y, "labels": []}
+                self.native_mouse_down = down
+                return
+            x, y, hwnd, blank = self._desktop_press
+            if not blank and self.desktop_clicks.is_desktop_list(hwnd):
                 self.native_drag = {"x": x, "y": y, "labels": []}
         elif down and self.native_drag is not None and not self.native_drag["labels"]:
             self.native_drag["labels"] = self.shell.selected_native_labels()
