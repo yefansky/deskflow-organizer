@@ -79,7 +79,8 @@ class Manager:
         self.root.after_idle(self.root.withdraw)
         self.update_silent = False
         watch_update(lambda: self.tray_actions.put(("exit", None)))
-        self.root.after(12000, lambda: self.check_for_updates(silent=True))
+        if FROZEN:
+            self.root.after(12000, lambda: self.check_for_updates(silent=True))
     @staticmethod
     def load_brand_icon(size: int):
         try:
@@ -259,6 +260,9 @@ class Manager:
         self.install.configure(state="disabled" if installed else "normal"); self.enable.configure(state="normal" if installed else "disabled")
         self.stop.configure(state="normal" if live else "disabled"); self.remove.configure(state="normal" if installed else "disabled")
     def check_for_updates(self, silent=False):
+        if not FROZEN:
+            self.update_status.set("源码版请使用 Git 同步更新，不安装 Release")
+            return
         if self.update_busy: return
         self.update_silent = silent
         self.update_busy=True; self.update_button.configure(state="disabled"); self.update_status.set("正在检查 GitHub Release…")
@@ -267,6 +271,10 @@ class Manager:
             except Exception as exc: self.tray_actions.put(("update-error", str(exc)))
         threading.Thread(target=worker, name="deskflow-update-check", daemon=True).start()
     def handle_update_result(self, release):
+        if not FROZEN:
+            self.update_busy=False; self.update_button.configure(state="normal")
+            self.update_status.set("源码版请使用 Git 同步更新，不安装 Release")
+            return
         tag=str(release.get("tag_name", ""))
         try: available=is_newer_version(tag)
         except Exception as exc:
@@ -288,6 +296,10 @@ class Manager:
         if not getattr(self, "update_silent", False):
             messagebox.showerror("DESKFLOW 更新失败",detail,parent=self.root)
     def apply_downloaded_update(self, package: str):
+        if not FROZEN:
+            self.update_busy=False; self.update_button.configure(state="normal")
+            self.update_status.set("源码版请使用 Git 同步更新，不安装 Release")
+            return
         try:
             spawn_update(Path(package), os.getpid())
         except Exception as exc:

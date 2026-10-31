@@ -38,6 +38,26 @@ class ManagerAsyncTests(unittest.TestCase):
         worker.join(3)
         self.assertFalse(worker.is_alive())
 
+    def test_source_mode_never_checks_or_installs_release(self):
+        m = self.manager
+        m.update_status = Mock()
+        m.update_button = Mock()
+        m.update_busy = True
+        with patch("deskflow_manager.FROZEN", False), \
+             patch("deskflow_manager.latest_release") as latest, \
+             patch("deskflow_manager.messagebox.askyesno") as prompt, \
+             patch("deskflow_manager.download_and_verify") as download, \
+             patch("deskflow_manager.spawn_update") as install:
+            m.check_for_updates(silent=True)
+            m.check_for_updates()
+            m.handle_update_result({"tag_name": "v999.0.0"})
+            m.apply_downloaded_update("unused.zip")
+        latest.assert_not_called()
+        prompt.assert_not_called()
+        download.assert_not_called()
+        install.assert_not_called()
+        self.assertFalse(m.update_busy)
+
     def test_refresh_coalesces_and_exception_completion_clears_pending(self):
         m = self.manager
         with patch("deskflow_manager.threading.Thread", DeferredThread):
