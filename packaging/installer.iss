@@ -40,14 +40,14 @@ Source: "..\docs\MCP.md"; DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "..\VERSION"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{userdesktop}\DESKFLOW 管理器"; Filename: "{app}\DESKFLOW.exe"; Parameters: "--start"
-Name: "{group}\DESKFLOW"; Filename: "{app}\DESKFLOW.exe"; Parameters: "--start"
+Name: "{userdesktop}\DESKFLOW 管理器"; Filename: "{app}\DESKFLOW.exe"; Parameters: "--start --show"
+Name: "{group}\DESKFLOW"; Filename: "{app}\DESKFLOW.exe"; Parameters: "--start --show"
 Name: "{group}\Uninstall DESKFLOW"; Filename: "{uninstallexe}"
 
 [Registry]
 Root: HKCU; Subkey: "Software\Classes\DesktopBackground\Shell\DESKFLOW"; ValueType: string; ValueData: "DESKFLOW"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\DesktopBackground\Shell\DESKFLOW"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\DESKFLOW.exe"
-Root: HKCU; Subkey: "Software\Classes\DesktopBackground\Shell\DESKFLOW\command"; ValueType: string; ValueData: """{app}\DESKFLOW.exe"" --start"
+Root: HKCU; Subkey: "Software\Classes\DesktopBackground\Shell\DESKFLOW\command"; ValueType: string; ValueData: """{app}\DESKFLOW.exe"" --start --show"
 
 [Run]
 Filename: "{app}\DESKFLOW.exe"; Parameters: "--install"; Description: "Start DESKFLOW"; Flags: nowait postinstall skipifsilent

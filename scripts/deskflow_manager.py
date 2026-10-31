@@ -310,7 +310,7 @@ class Manager:
         try:
             DESKTOP_SHORTCUT.parent.mkdir(parents=True, exist_ok=True)
             shortcut = Dispatch("WScript.Shell").CreateShortcut(str(DESKTOP_SHORTCUT))
-            launch = command("manager", "--start")
+            launch = command("manager", "--start", "--show")
             shortcut.TargetPath = launch[0]
             shortcut.Arguments = subprocess.list2cmdline(launch[1:])
             shortcut.WorkingDirectory = str(APP_ROOT)
@@ -329,7 +329,7 @@ class Manager:
             winreg.SetValueEx(menu, "Icon", 0, winreg.REG_SZ, str(ICON_ICO if ICON_ICO.exists() else Path(sys.executable)))
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key + r"\command") as command:
             from app_runtime import command as launch_command
-            winreg.SetValueEx(command, None, 0, winreg.REG_SZ, subprocess.list2cmdline(launch_command("manager", "--start")))
+            winreg.SetValueEx(command, None, 0, winreg.REG_SZ, subprocess.list2cmdline(launch_command("manager", "--start", "--show")))
 
     def remove_context_menu(self):
         key = r"Software\Classes\DesktopBackground\Shell\DESKFLOW"
@@ -545,6 +545,7 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument("--install",action="store_true")
     parser.add_argument("--start",action="store_true",help="start the manager and desktop blocks")
+    parser.add_argument("--show", action="store_true", help="show the manager window")
     parser.add_argument("--log-level", choices=("debug", "info", "warn", "error"), help="enable local 200 KiB rotating diagnostics beside the program")
     args,_unknown=parser.parse_known_args()
     configure_logging(args.log_level, role="manager")
@@ -552,14 +553,34 @@ def main():
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
     kernel32.CreateMutexW.restype = ctypes.c_void_p
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel32.CreateEventW.restype = ctypes.c_void_p
+    kernel32.SetEvent.argtypes = [ctypes.c_void_p]
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    show_event = kernel32.CreateEventW(None, False, False, "Local\\DeskflowOrganizer.ShowManager")
+    if not show_event:
+        raise ctypes.WinError()
     kernel32.SetLastError(0)
     instance_mutex = kernel32.CreateMutexW(None, False, "Local\\DeskflowOrganizer.Manager")
     if not instance_mutex or kernel32.GetLastError() == 183:
         # A tray manager already owns the lifecycle.  The organizer itself has
         # a second mutex, so a double click can never create duplicate blocks.
+        if instance_mutex and args.show:
+            kernel32.SetEvent(show_event)
+        if instance_mutex:
+            kernel32.CloseHandle(instance_mutex)
+        kernel32.CloseHandle(show_event)
         raise SystemExit(0)
     try:
         manager=Manager()
+        def poll_show_request():
+            if kernel32.WaitForSingleObject(show_event, 0) == 0:
+                manager.show_manager()
+            if manager.root.winfo_exists():
+                manager.root.after(80, poll_show_request)
+        manager.root.after(80, poll_show_request)
+        if args.show:
+            manager.root.after_idle(manager.show_manager)
         if FROZEN: print('Manager initialized.', flush=True)
         if args.install or args.start:
             manager.install_app()
@@ -570,6 +591,7 @@ def main():
         manager.root.mainloop()
     finally:
         kernel32.CloseHandle(instance_mutex)
+        kernel32.CloseHandle(show_event)
 
 if __name__ == "__main__":
     main()
