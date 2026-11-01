@@ -29,6 +29,48 @@ def gui_python() -> str:
     candidate = Path(sys.executable).with_name("pythonw.exe")
     return str(candidate if candidate.exists() else sys.executable)
 
+
+# Windows 会把「强制重定向信任」策略继承给子进程；带该策略的实例启动的
+# Bambu Studio 等程序读取跨盘 junction 时会报「不受信任的装入点」[system:448]。
+# 复位只能由不继承该策略的父上下文完成，所以这里用 WMI（父进程 WmiPrvSE）重建实例。
+PROCESS_REDIRECTION_TRUST_POLICY = 16
+REDIRECTION_TRUST_ENFORCE = 0x1
+CLEAN_RESTART_SCRIPT = """$ErrorActionPreference = 'Stop'
+$planPath = Join-Path $PSScriptRoot 'clean-restart-plan.json'
+$plan = Get-Content -Raw -Encoding UTF8 $planPath | ConvertFrom-Json
+$deadline = (Get-Date).AddSeconds(30)
+while ((Get-Process -Id $plan.wait_pid -ErrorAction SilentlyContinue) -and ((Get-Date) -lt $deadline)) {
+    Start-Sleep -Milliseconds 250
+}
+Start-Sleep -Milliseconds 500
+$commandLine = '"' + $plan.executable + '"'
+foreach ($argument in $plan.arguments) { $commandLine += ' "' + $argument + '"' }
+$result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $commandLine; CurrentDirectory = $plan.cwd }
+if ($result.ReturnValue -ne 0) { exit 1 }
+"""
+
+
+def process_redirection_flags(pid: int) -> int | None:
+    """Return PROCESS_MITIGATION_REDIRECTION_TRUST_POLICY flags, or None when unreadable."""
+    try:
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_bool, ctypes.c_uint32]
+        kernel.OpenProcess.restype = ctypes.c_void_p
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel.GetProcessMitigationPolicy.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+        kernel.GetProcessMitigationPolicy.restype = ctypes.c_bool
+        handle = kernel.OpenProcess(0x1000, False, int(pid))
+        if not handle: return None
+        try:
+            value = ctypes.c_uint32(0)
+            if not kernel.GetProcessMitigationPolicy(handle, PROCESS_REDIRECTION_TRUST_POLICY, ctypes.byref(value), ctypes.sizeof(value)):
+                return None
+            return int(value.value)
+        finally:
+            kernel.CloseHandle(handle)
+    except (AttributeError, OSError):
+        return None
+
 def windows_desktop() -> Path:
     """Return the user's actual Desktop, including redirected Desktop folders."""
     try:
@@ -422,6 +464,48 @@ class Manager:
             try: subprocess.run(["taskkill","/PID",str(pid),"/T","/F"],capture_output=True)
             except OSError: pass
         self.data["pid"]=None; save(self.data); self.refresh()
+    def clean_restart_paths(self):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        return STATE_DIR / "clean-restart.ps1", STATE_DIR / "clean-restart-plan.json"
+    def write_clean_restart_launcher(self) -> Path:
+        """Write a detached launcher that rebuilds the manager from a clean parent."""
+        script, plan = self.clean_restart_paths()
+        launch = command("manager", "--start")
+        payload = {"wait_pid": os.getpid(), "executable": launch[0], "arguments": list(launch[1:]), "cwd": str(APP_ROOT)}
+        plan.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        script.write_text(CLEAN_RESTART_SCRIPT, encoding="utf-8-sig", newline="\r\n")
+        return script
+    def spawn_clean_restart(self) -> None:
+        script = self.write_clean_restart_launcher()
+        powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+        subprocess.Popen(
+            [str(powershell), "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", str(script)],
+            close_fds=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    def restart_clean(self):
+        """Restart through a clean parent so an inherited RedirectionTrust policy is dropped."""
+        flags = process_redirection_flags(os.getpid())
+        if flags is None:
+            state = "未能读取当前实例的启动策略。"
+        elif flags & REDIRECTION_TRUST_ENFORCE:
+            state = "当前实例带有「重定向信任」策略，这是第三方程序报 system:448 的根因，重启后会清除。"
+        else:
+            state = "当前实例的启动策略正常，重启只用于刷新。"
+        prompt = (
+            "将先恢复原生桌面图标，再用干净上下文重启 DESKFLOW。\n"
+            "分类与布局不会改变，重启期间整理块会短暂消失。\n\n"
+            + state + "\n\n是否继续？"
+        )
+        if not messagebox.askyesno("修复启动上下文并重启", prompt, parent=self.root):
+            return
+        try:
+            self.spawn_clean_restart()
+        except OSError as error:
+            logger.exception("manager.restart_clean.launch_failed")
+            messagebox.showerror("修复启动上下文", f"无法启动清理器：{error}", parent=self.root)
+            return
+        logger.info("manager.restart_clean requested flags=%s", flags)
+        self.exit_desktopflow()
     def set_autostart(self):
         self.data["autostart"]=bool(self.auto.get())
         if self.auto.get():
@@ -507,6 +591,8 @@ class Manager:
                 self.handle_update_error(str(target))
             elif action == "update-ready":
                 self.apply_downloaded_update(str(target)); return
+            elif action == "restart-clean":
+                self.restart_clean(); return
             elif action == "exit":
                 self.exit_desktopflow(); return
         if self.root.winfo_exists(): self.root.after(80, self.process_tray_actions)
@@ -522,6 +608,7 @@ class Manager:
             pystray.MenuItem("当前屏幕弹性重排",self.tray_arrange_current),
             pystray.MenuItem("移动全部到指定屏幕并弹性排版",monitor_menu),
             pystray.MenuItem("暂停并显示原生图标",self.enqueue_tray_action("stop")),
+            pystray.MenuItem("修复启动上下文并重启（system:448 时用）",self.enqueue_tray_action("restart-clean")),
             pystray.MenuItem("修复公共桌面重复图标（需要管理员确认）",self.enqueue_tray_action("repair-public-icons")),
             pystray.MenuItem("检查 GitHub Release 更新",self.enqueue_tray_action("check-update")),
             pystray.Menu.SEPARATOR,
