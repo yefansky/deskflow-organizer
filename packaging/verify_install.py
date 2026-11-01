@@ -121,6 +121,7 @@ def main():
     before_uninstall = state.read_bytes()
     run([install / 'unins000.exe', '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/LOG=' + str(evidence / 'uninstall.log')])
     assert not (install / 'DESKFLOW.exe').exists()
+    assert not (install / 'skills/deskflow-organizer/SKILL.md').exists()
     assert state.read_bytes() == before_uninstall
     (evidence / 'installation.json').write_text(json.dumps({'ok': True, 'old_version': old_version, 'new_version': new_version,
         'shortcut': shortcut, 'handoff_seconds': elapsed, 'mcp_lock_released': True, 'legacy_mcp': True,

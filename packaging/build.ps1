@@ -9,8 +9,12 @@ try {
         else { $ISCC = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
     }
     if (-not (Test-Path -LiteralPath $ISCC)) { throw 'Install Inno Setup 6 or pass -ISCC with its compiler path.' }
+    & $Python packaging/verify_documents.py $root
+    if ($LASTEXITCODE -ne 0) { throw 'Agent documentation validation failed.' }
     & $Python -m PyInstaller --noconfirm --clean packaging/deskflow.spec
     if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed.' }
+    & $Python packaging/verify_documents.py --stage $root (Join-Path $root 'dist/DESKFLOW')
+    if ($LASTEXITCODE -ne 0) { throw 'Agent documentation staging failed.' }
     $version = (Get-Content VERSION -Raw).Trim()
     if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid VERSION.' }
     & $ISCC "/DAppVersion=$version" packaging/installer.iss

@@ -1,4 +1,4 @@
-#ifndef AppVersion
+﻿#ifndef AppVersion
   #define AppVersion "0.3.0"
 #endif
 [Setup]
@@ -34,14 +34,13 @@ Source: "legacy-mcp.py"; DestDir: "{app}\scripts"; DestName: "mcp_server.py"; Fl
 Source: "legacy-launch.py"; DestDir: "{app}\scripts"; DestName: "deskflow_manager.py"; Flags: ignoreversion
 Source: "legacy-launch.py"; DestDir: "{app}\scripts"; DestName: "smart_desktop.py"; Flags: ignoreversion
 Source: "legacy-uninstall.ps1"; DestDir: "{app}"; DestName: "uninstall.ps1"; Flags: ignoreversion
-Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\AI接入说明.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\docs\MCP.md"; DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "..\VERSION"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{userdesktop}\DESKFLOW 管理器"; Filename: "{app}\DESKFLOW.exe"; Parameters: "--start --show"
 Name: "{group}\DESKFLOW"; Filename: "{app}\DESKFLOW.exe"; Parameters: "--start --show"
+Name: "{group}\Deskflow AI 使用说明"; Filename: "{app}\skills\deskflow-organizer\README.md"
 Name: "{group}\Uninstall DESKFLOW"; Filename: "{uninstallexe}"
 
 [Registry]

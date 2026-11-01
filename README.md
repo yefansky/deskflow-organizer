@@ -12,7 +12,7 @@ DESKFLOW 是面向 Windows 的桌面覆盖层与托盘管理器。它扫描桌�
 2. 双击安装，默认安装到 `%LOCALAPPDATA%\Programs\DeskflowOrganizer`，无需管理员权限。
 3. 安装后桌面有 `DESKFLOW 管理器` 快捷方式，也可通过开始菜单启动。管理器默认驻留右下角托盘。
 
-安装包包含主程序、运行依赖和 `DeskflowMCP.exe`。首次安装需要下载完整安装包，安装过程无需联网安装 Python 依赖。
+安装包包含主程序、运行依赖、`DeskflowMCP.exe` 和独立的 [Deskflow 整理 skill](skills/deskflow-organizer/README.md)。安装目录的 `skills/deskflow-organizer/SKILL.md` 是第三方 agent 入口，开始菜单提供“Deskflow AI 使用说明”。首次安装需要下载完整安装包，安装过程无需联网安装 Python 依赖。
 
 ## 更新
 
@@ -36,15 +36,9 @@ v0.2 的 ZIP 更新器仍可下载 `DESKFLOW-windows-x64.zip`，它现在是迁�
 
 ## 让代码 agent 操作桌面
 
-推荐按需读取 [AI 接入说明](AI接入说明.md)：让 Codex 从正在运行的 Deskflow 进程找到源码或安装目录，读说明后直接调用已有本机接口。无需安装全局 skill、注册 MCP 或修改 agent 配置；源码运行与安装版都可用，不影响已有分类。
+推荐让本机代码 agent 按需读取 [Deskflow 整理 skill](skills/deskflow-organizer/SKILL.md)（[使用说明](skills/deskflow-organizer/README.md)）。先从运行进程找到产品目录，核对服务，再通过现有本机 HTTP 接口读取目录、深查必要项目、预演、批量归类和回读核验。无需安装全局 skill 或修改 agent 配置。
 
-下列 MCP 是可选兼容方式，无需为普通按需操作全局启用。
-
-安装版自带标准输入输出 MCP 服务，入口为安装目录的 `DeskflowMCP.exe`。它支持目录读取、摘要、标签、批量归类、分类管理、布局、样式、排序和位置调整，服务仅连接本机。
-
-运行 `DeskflowMCP.exe --print-config` 可输出当前机器的绝对路径配置，无需安装开发环境。接入后 agent 可通过标准 `tools/list` 自动发现18个工具，通过 `resources/list` / `prompts/list` 发现整理说明；紧凑目录提供分类、图标顺序与人工归类，`get_desktop_arrangement` 提供保存的块位置和排布。批量整理支持无写入预演，默认保护人工分类。
-
-配置示例、协议版本、错误结构及诊断参数见 [MCP 接入说明](docs/MCP.md)。旧版 `scripts/mcp_server.py` 配置也可继续使用。更新时 MCP 连接会退出以释放文件占用，升级后在客户端重新连接即可。
+第三方 agent 无需私人知识库。根目录 [AI 接入说明](AI接入说明.md) 和开始菜单“Deskflow AI 使用说明”均能找到这个包。包内还提供公共桌面图标需要管理员同意 UAC、连接/显示/更新故障等 [常见问题与解决办法](skills/deskflow-organizer/references/troubleshooting.md)。
 
 ## 卸载
 

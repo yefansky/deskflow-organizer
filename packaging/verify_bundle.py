@@ -6,10 +6,12 @@ import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from verify_documents import verify_documents
 
 
 def verify(bundle):
     bundle = Path(bundle).resolve()
+    verify_documents(bundle)
     evidence = Path('build/verification').resolve()
     evidence.mkdir(parents=True, exist_ok=True)
     output = evidence / 'gui-smoke.json'
