@@ -27,6 +27,9 @@ class NativeIconNotificationsTest(unittest.TestCase):
         shell._find_listview = Mock(return_value=1)
         shell._save_attribute_state = Mock()
         shell._ensure_guard = Mock()
+        # These tests isolate attribute/notification behavior after the
+        # independently tested overlay display prerequisite has succeeded.
+        shell.can_hide_icons = Mock(return_value=True)
         return shell
 
     def test_local_notifications_preserve_unrelated_icon_cache(self):

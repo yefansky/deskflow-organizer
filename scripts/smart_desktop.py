@@ -1373,6 +1373,7 @@ class DesktopShell:
     def __init__(self) -> None:
         self.user32 = ctypes.windll.user32
         self.kernel32 = ctypes.windll.kernel32
+        self._configure_window_api()
         self.listview = self._find_listview()
         self.host = self._find_overlay_host()
         self.hidden = False
@@ -1469,8 +1470,30 @@ class DesktopShell:
         # container available for this process.
         return defview
 
+    def can_hide_icons(self) -> bool:
+        """A failed/empty overlay must never replace Explorer's visible icons.
+
+        Favorite focus deliberately hides panels (including all panels when
+        there are no favorites).  That explicit state is not a display failure,
+        but the windows must still exist and have the verified desktop owner.
+        """
+        if not self.host or not self.panel_windows:
+            return False
+        intentionally_hidden = getattr(self, "hidden_panel_windows", set())
+        return all(
+            self.user32.IsWindow(window) and self.panel_is_desktop_child(window_id)
+            and (window_id in intentionally_hidden or self.panel_is_visible(window_id))
+            for window_id, window in self.panel_windows.items()
+        )
+
     def hide_icons(self, organized_paths: list[str]) -> None:
         """Hide only organized filesystem entries; keep native virtual/new icons."""
+        if not self.can_hide_icons():
+            logger.warning("desktop.hide refused host=%s panels=%s", self.host, len(self.panel_windows))
+            self.organized_native_paths = []
+            self.attribute_errors = {}
+            self.restore_icons()
+            return
         self.organized_native_paths = list(organized_paths)
         self.listview = self._find_listview()
         if self.listview: self.user32.ShowWindow(self.listview, self.SW_SHOW)
@@ -1565,40 +1588,87 @@ class DesktopShell:
             self.kernel32.CloseHandle(process)
         return labels
 
+    def _configure_window_api(self) -> None:
+        """Use pointer-sized HWND/LONG_PTR values, including on 64-bit Python."""
+        hwnd = ctypes.wintypes.HWND
+        signatures = {
+            "FindWindowW": ([ctypes.wintypes.LPCWSTR, ctypes.wintypes.LPCWSTR], hwnd),
+            "FindWindowExW": ([hwnd, hwnd, ctypes.wintypes.LPCWSTR, ctypes.wintypes.LPCWSTR], hwnd),
+            "GetAncestor": ([hwnd, ctypes.wintypes.UINT], hwnd),
+            "GetWindow": ([hwnd, ctypes.wintypes.UINT], hwnd),
+            "IsWindow": ([hwnd], ctypes.wintypes.BOOL),
+            "IsWindowVisible": ([hwnd], ctypes.wintypes.BOOL),
+            "ShowWindow": ([hwnd, ctypes.c_int], ctypes.wintypes.BOOL),
+            "GetWindowRect": ([hwnd, ctypes.POINTER(ctypes.wintypes.RECT)], ctypes.wintypes.BOOL),
+            "GetWindowLongW": ([hwnd, ctypes.c_int], ctypes.wintypes.LONG),
+            "SetWindowLongW": ([hwnd, ctypes.c_int, ctypes.wintypes.LONG], ctypes.wintypes.LONG),
+            "SetWindowPos": ([hwnd, hwnd, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                              ctypes.c_int, ctypes.wintypes.UINT], ctypes.wintypes.BOOL),
+        }
+        for name, (arguments, result) in signatures.items():
+            function = getattr(self.user32, name)
+            function.argtypes, function.restype = arguments, result
+        if hasattr(self.user32, "SetWindowLongPtrW"):
+            function = self.user32.SetWindowLongPtrW
+            function.argtypes = [hwnd, ctypes.c_int, ctypes.c_ssize_t]
+            function.restype = ctypes.c_ssize_t
+        self.kernel32.SetLastError.argtypes = [ctypes.wintypes.DWORD]
+        self.kernel32.SetLastError.restype = None
+        self.kernel32.GetLastError.argtypes = []
+        self.kernel32.GetLastError.restype = ctypes.wintypes.DWORD
+        self._window_api_configured = True
+
+    def _attach_call(self, operation, function, *arguments, zero_is_failure=False):
+        # SetWindowLong[Ptr] can return 0 on success (the previous value was 0).
+        # Capture the error immediately, before any logging/readback Win32 call.
+        self.kernel32.SetLastError(0)
+        result = function(*arguments)
+        error = int(self.kernel32.GetLastError())
+        failed = not result and (zero_is_failure or error != 0)
+        log = logger.error if failed else logger.debug
+        log("desktop.attach.api operation=%s hwnd=%s result=%s error=%s pid=%s thread=%s",
+            operation, arguments[0] if arguments else 0, result, error,
+            os.getpid(), threading.get_native_id())
+        return result
+
     def attach(self, window_id: int) -> bool:
         """Place a real-alpha desktop popup below normal application windows."""
         if not self.host: return False
+        if not getattr(self, "_window_api_configured", False):
+            self._configure_window_api()
         # Tk's winfo_id is its client child.  Re-parenting that child leaves the
         # enclosing TkTopLevel unaffected, so take its real root.
-        outer_window = self.user32.GetAncestor(window_id, 2) or window_id  # GA_ROOT
+        outer_window = self._attach_call("GetAncestor.panel", self.user32.GetAncestor, window_id, 2) or window_id
         # DefView can itself be a top-level desktop window (or live below a
         # WorkerW).  Its root is the stable owner; GetParent(DefView) is not.
-        desktop_owner = self.user32.GetAncestor(self.host, 2) or self.host  # GA_ROOT
+        desktop_owner = self._attach_call("GetAncestor.desktop", self.user32.GetAncestor, self.host, 2) or self.host
         if not desktop_owner: return False
         set_owner = getattr(self.user32, "SetWindowLongPtrW", self.user32.SetWindowLongW)
-        set_owner.restype = ctypes.c_ssize_t
-        set_owner(outer_window, -8, desktop_owner)  # GWLP_HWNDPARENT / owner
-        style = self.user32.GetWindowLongW(outer_window, -16) & 0xFFFFFFFF
+        self._attach_call("SetWindowLongPtr.owner", set_owner, outer_window, -8, desktop_owner)
+        style = self._attach_call("GetWindowLong.style", self.user32.GetWindowLongW, outer_window, -16) & 0xFFFFFFFF
         popup_style = (style & ~0x40000000) | 0x80000000  # WS_CHILD -> WS_POPUP
         if popup_style >= 0x80000000: popup_style -= 0x100000000
-        self.user32.SetWindowLongW(outer_window, -16, popup_style)
+        self._attach_call("SetWindowLong.style", self.user32.SetWindowLongW, outer_window, -16, popup_style)
         # A desktop block accepts pointer input but must never become the
         # foreground top-level window.  Without WS_EX_NOACTIVATE, clicking a
         # title bar to drag it promotes the popup above the user's editor or
         # browser until the next maintenance tick.
-        ex_style = self.user32.GetWindowLongW(outer_window, -20) & 0xFFFFFFFF
+        ex_style = self._attach_call("GetWindowLong.ex_style", self.user32.GetWindowLongW, outer_window, -20) & 0xFFFFFFFF
         if ex_style & 0x00000008:
-            self.user32.SetWindowPos(outer_window, -2, 0, 0, 0, 0, 0x0003 | 0x0010 | 0x0200)
+            self._attach_call("SetWindowPos.not_topmost", self.user32.SetWindowPos,
+                              outer_window, -2, 0, 0, 0, 0, 0x0003 | 0x0010 | 0x0200, zero_is_failure=True)
         no_activate_style = (ex_style | 0x08000000) & ~0x00000008  # NOACTIVATE, never TOPMOST
         if no_activate_style >= 0x80000000: no_activate_style -= 0x100000000
-        self.user32.SetWindowLongW(outer_window, -20, no_activate_style)
+        self._attach_call("SetWindowLong.ex_style", self.user32.SetWindowLongW, outer_window, -20, no_activate_style)
         # `-alpha` intentionally leaves WS_EX_LAYERED on.  Unlike a layered
         # child of DefView, this popup is composed by DWM and remains truly
         # translucent.  Insert directly above the desktop owner's z-band.
-        self.user32.SetWindowPos(outer_window, desktop_owner, 0, 0, 0, 0, 0x0003 | 0x0010 | 0x0020 | 0x0200)
-        if self.user32.GetWindow(outer_window, 4) != desktop_owner:
+        self._attach_call("SetWindowPos.desktop_band", self.user32.SetWindowPos,
+                          outer_window, desktop_owner, 0, 0, 0, 0, 0x0003 | 0x0010 | 0x0020 | 0x0200, zero_is_failure=True)
+        owner = self._attach_call("GetWindow.owner", self.user32.GetWindow, outer_window, 4)
+        if owner != desktop_owner:
             logger.error("desktop.attach failed hwnd=%s owner=%s expected=%s", outer_window,
-                         self.user32.GetWindow(outer_window, 4), desktop_owner)
+                         owner, desktop_owner)
             return False  # GW_OWNER
         self.panel_windows[window_id] = outer_window
         logger.debug("desktop.attach hwnd=%s host=%s owner=%s", outer_window, self.host, desktop_owner)

@@ -7,6 +7,7 @@ import tkinter as tk
 from tkinter import messagebox, colorchooser, ttk
 from urllib.request import Request, urlopen
 import pystray
+from pystray._util import win32 as tray_win32
 from PIL import Image, ImageDraw, ImageTk
 from win32com.client import Dispatch
 import win32api
@@ -88,6 +89,121 @@ def load():
     except (OSError, json.JSONDecodeError): return {"installed": False, "pid": None, "autostart": False, "minimize_to_tray": True}
 def save(data): STATE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
+def notify_tray(code, data):
+    """Keep the BOOL and thread-local error from this exact Shell call."""
+    api = ctypes.WinDLL("shell32", use_last_error=True).Shell_NotifyIconW
+    api.argtypes = (ctypes.wintypes.DWORD, ctypes.POINTER(tray_win32.NOTIFYICONDATAW))
+    api.restype = ctypes.wintypes.BOOL
+    ctypes.set_last_error(0)
+    result = bool(api(code, ctypes.byref(data)))
+    error = ctypes.get_last_error()
+    return result, error
+
+
+class RegisteredTrayIcon(pystray.Icon):
+    """Small Windows adapter: preserve pystray's loop/menu, audit registration.
+
+    Uses the installed pystray Windows backend's private message/ready hooks.
+    No process-global patch and no third-party files are modified.
+    """
+    RETRY_MESSAGE = tray_win32.WM_USER + 43
+
+    def __init__(self, *args, report, **kwargs):
+        self.registered = False
+        self._report = report
+        self._worker = None
+        self._loop_entered = False
+        super().__init__(*args, **kwargs)
+        self._message_handlers[self.RETRY_MESSAGE] = self._retry_message
+
+    def _message(self, code, flags, **kwargs):
+        data = tray_win32.NOTIFYICONDATAW(
+            cbSize=ctypes.sizeof(tray_win32.NOTIFYICONDATAW),
+            hWnd=self._hwnd, uID=0, uFlags=flags, **kwargs)
+        result, error = notify_tray(code, data)
+        logger.info("tray.notify code=%s hwnd=%s uid=0 ok=%s error=%s",
+                    code, self._hwnd, result, error)
+        if code == tray_win32.NIM_ADD:
+            self.registered = result
+        elif code == tray_win32.NIM_DELETE or not result:
+            self.registered = False
+        self._report(self, self.registered, f"Shell code={code}, ok={result}, error={error}")
+        return result
+
+    def _mark_ready(self):
+        super()._mark_ready()
+        # No default setup thread: a pre-ready window failure must not leave
+        # an invisible setup thread waiting forever on pystray's ready queue.
+        self.visible = True
+
+    def _create_window(self, atom):
+        # The backend assigns _hwnd only after this method returns.  Preserve
+        # its top-level popup/filter contract, but own the half-created window
+        # if the filter fails before that assignment can happen.
+        hwnd = tray_win32.CreateWindowEx(
+            0, atom, None, tray_win32.WS_POPUP, 0, 0, 0, 0,
+            0, None, tray_win32.GetModuleHandle(None), None)
+        try:
+            tray_win32.ChangeWindowMessageFilterEx(
+                hwnd, tray_win32.WM_TASKBARCREATED, tray_win32.MSGFLT_ALLOW, None)
+        except Exception:
+            try: tray_win32.DestroyWindow(hwnd)
+            except Exception: logger.exception("tray.partial_window_cleanup failed")
+            raise
+        return hwnd
+
+    def run_detached(self, setup=None):
+        if setup is not None:
+            raise ValueError("RegisteredTrayIcon manages its own readiness")
+        if self.worker_alive():
+            return
+        def run():
+            try:
+                super(RegisteredTrayIcon, self)._run()
+            except Exception as exc:
+                logger.exception("tray.thread failed")
+                self._report(self, False, f"托盘线程启动失败：{exc}")
+            finally:
+                if not self._loop_entered:
+                    # _run can fail while creating its first/second window,
+                    # before pystray's normal mainloop cleanup takes ownership.
+                    self._HWND_TO_ICON.pop(self._hwnd, None)
+                    for hwnd in (self._hwnd, self._menu_hwnd):
+                        if hwnd:
+                            try: tray_win32.DestroyWindow(hwnd)
+                            except Exception: logger.exception("tray.window_cleanup failed")
+                    try: self._unregister_class(self._atom)
+                    except Exception: logger.exception("tray.class_cleanup failed")
+                self.registered = False
+                self._running = False
+                self._report(self, False, "托盘线程已停止")
+        self._worker = threading.Thread(target=run, name="deskflow-tray", daemon=True)
+        self._worker.start()
+
+    def _mainloop(self):
+        self._loop_entered = True
+        return super()._mainloop()
+
+    def worker_alive(self):
+        return self._worker is not None and self._worker.is_alive()
+
+    def retry_registration(self):
+        if not self.worker_alive() or not self._hwnd:
+            return False
+        # Execute on the existing tray message thread, never spawn another.
+        tray_win32.PostMessage(self._hwnd, self.RETRY_MESSAGE, 0, 0)
+        return True
+
+    def _retry_message(self, _wparam, _lparam):
+        self._hide()
+        self._show()
+
+    def stop(self):
+        # pystray's base stop assumes its optional setup thread was created.
+        if self.worker_alive() and self._hwnd:
+            self._stop()
+
+
 class Manager:
     def __init__(self):
         self.data=load(); self.root=tk.Tk(); self.root.title("DESKFLOW · 智能桌面整理管理器")
@@ -112,13 +228,14 @@ class Manager:
         self.scrollbar.pack(side="right",fill="y")
         self.status=tk.StringVar(); self.update_status=tk.StringVar(value=f"当前版本 {current_version()}")
         self.update_busy=False; self.tray_icon=None; self.tray_actions=queue.Queue(); self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
+        self._tray_ready=False; self._tray_hide_pending=True
+        self.tray_status=tk.StringVar(value="正在连接通知区域…")
         self.draw(); self.refresh()
-        # The manager is a tray resident utility.  Its window is only shown
-        # when the user explicitly chooses “打开 DESKFLOW 管理器” from the tray.
+        # Stay visible until Shell acknowledges the tray icon.  A background
+        # thread or a Python Icon object alone is not a usable control entry.
         self.ensure_tray()
         self.root.after(80, self.process_tray_actions)
         self.root.after_idle(self.fit_to_work_area)
-        self.root.after_idle(self.root.withdraw)
         self.update_silent = False
         watch_update(lambda: self.tray_actions.put(("exit", None)))
         if FROZEN:
@@ -198,6 +315,9 @@ class Manager:
         self.action_button(lower,"打开整理器设置",self.open_settings,tone="secondary").pack(side="right")
         self.update_button=self.action_button(lower,"检查更新",self.check_for_updates,tone="secondary")
         self.update_button.pack(side="right",padx=(0,8))
+        tray_row=tk.Frame(body,bg=bg); tray_row.pack(fill="x",padx=28,pady=3)
+        tk.Label(tray_row,textvariable=self.tray_status,fg="#8fdff3",bg=bg,anchor="w",wraplength=450).pack(side="left",fill="x",expand=True)
+        self.action_button(tray_row,"重试托盘",self.retry_tray,tone="secondary").pack(side="right")
         tk.Label(body,textvariable=self.update_status,fg="#8fdff3",bg=bg).pack(anchor="e",padx=28,pady=(0,3))
         recovery=tk.LabelFrame(body,text="屏幕恢复与排版",fg="#a9dff0",bg=bg,highlightbackground="#314564",highlightthickness=1,padx=10,pady=5,font=("Microsoft YaHei UI",9,"bold"))
         recovery.pack(fill="x",padx=28,pady=(0,4))
@@ -545,7 +665,22 @@ class Manager:
             try: action, target = self.tray_actions.get_nowait()
             except queue.Empty: break
             if action == "show":
+                self._tray_hide_pending = False
                 self.root.deiconify(); self.root.lift(); self.root.focus_force()
+            elif action == "tray-result":
+                icon, registered, detail = target
+                if icon is not self.tray_icon:
+                    continue
+                self._tray_ready = bool(registered and icon.registered and icon.worker_alive())
+                if self._tray_ready:
+                    self.tray_status.set("通知区域图标已注册；可能位于折叠区")
+                    if self._tray_hide_pending:
+                        self._tray_hide_pending = False
+                        self.root.withdraw()
+                else:
+                    logger.warning("tray.unavailable detail=%s", detail)
+                    self.tray_status.set("通知区域暂不可用，窗口保持打开；可点击“重试托盘”")
+                    self.root.deiconify()
             elif action == "enable":
                 self.enable_app()
             elif action == "arrange-current":
@@ -615,14 +750,41 @@ class Manager:
             pystray.MenuItem("退出 DESKFLOW",self.enqueue_tray_action("exit")),
         )
     def ensure_tray(self):
-        if self.tray_icon: return
+        if self.tray_icon and self.tray_icon.worker_alive():
+            return self._tray_ready and self.tray_icon.registered
         # Rebuild on every open, so monitors added during an RDP session are
         # available immediately without restarting the tray manager.
         menu=pystray.Menu(self.tray_menu_items)
-        self.tray_icon=pystray.Icon("DESKFLOW",self.tray_image(),"DESKFLOW 智能桌面整理",menu)
-        self.tray_icon.run_detached()
+        self._tray_ready = False
+        try:
+            self.tray_icon=RegisteredTrayIcon("DESKFLOW",self.tray_image(),"DESKFLOW 智能桌面整理",menu,
+                report=lambda icon, ready, detail: self.tray_actions.put(("tray-result", (icon, ready, detail))))
+            self.tray_icon.run_detached()
+        except Exception as exc:
+            logger.exception("tray.create failed")
+            self.tray_icon = None
+            self.tray_status.set(f"托盘创建失败，管理器保持可见：{exc}")
+            self.root.deiconify()
+        return False
+
+    def retry_tray(self):
+        """Explicit user retry; reuse a living thread, replace only a dead one."""
+        self.tray_status.set("正在重试通知区域图标…")
+        if self.tray_icon and self.tray_icon.worker_alive():
+            if not self.tray_icon.retry_registration():
+                self.tray_status.set("托盘线程尚未就绪，请稍后重试")
+            return
+        self.ensure_tray()
+
     def hide_to_tray(self):
-        if self.tray.get(): self.ensure_tray(); self.root.withdraw()
+        if self.tray.get():
+            self._tray_hide_pending = True
+            if self.ensure_tray():
+                self._tray_hide_pending = False
+                self.root.withdraw()
+            else:
+                self.root.deiconify()
+                self.tray_status.set("托盘未就绪，窗口保持可见；可点击“重试托盘”")
         else: self.exit_desktopflow()
     def exit_desktopflow(self):
         self.stop_app()
