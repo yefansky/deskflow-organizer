@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import win32api
+
 from deskflow_manager import Manager, RegisteredTrayIcon, notify_tray, tray_win32
 
 
@@ -13,11 +15,15 @@ class TrayRegistrationTests(unittest.TestCase):
         m = object.__new__(Manager)
         m.root = Mock()
         m.root.winfo_exists.return_value = True
+        m.root.after.return_value = "after#tray"
+        m.data = {}
         m.tray = Mock(get=lambda: True)
         m.tray_status = Mock()
         m.tray_actions = queue.Queue()
         m._tray_ready = registered
-        m._tray_hide_pending = False
+        m._tray_fallback_job = None
+        m._tray_retried = False
+        m._window_placement_hwnd = None
         m.tray_icon = Mock(registered=registered)
         m.tray_icon.worker_alive.return_value = alive
         return m
@@ -37,35 +43,51 @@ class TrayRegistrationTests(unittest.TestCase):
 
     def test_failed_registration_never_withdraws_manager(self):
         m = self.manager()
-        m.hide_to_tray()
+        m.tray_icon.retry_registration.return_value = False
+        with patch("deskflow_manager.save"):
+            m.hide_to_tray()
+        m.root.deiconify.assert_not_called()
+        m.show_tray_fallback()
         m.root.withdraw.assert_not_called()
         m.root.deiconify.assert_called_once()
-        self.assertTrue(m._tray_hide_pending)
+        self.assertIs(m.data["window_visible"], False)
 
     def test_registration_receipt_allows_pending_close(self):
         m = self.manager()
-        m.hide_to_tray()
+        with patch("deskflow_manager.save"):
+            m.hide_to_tray()
         m.tray_icon.registered = True
         m.tray_actions.put(("tray-result", (m.tray_icon, True, "ADD ok")))
         m.process_tray_actions()
         m.root.withdraw.assert_called_once()
         self.assertTrue(m._tray_ready)
-        self.assertFalse(m._tray_hide_pending)
+        self.assertIsNone(m._tray_fallback_job)
 
     def test_error_receipt_reopens_manager_without_worker_tk_calls(self):
         m = self.manager(registered=True)
+        m.tray_icon.registered = False
+        m.tray_icon.retry_registration.return_value = True
         m.tray_actions.put(("tray-result", (m.tray_icon, False, "ADD false error=0")))
         m.root.deiconify.assert_not_called()
         with patch("deskflow_manager.logger.warning") as log:
             m.process_tray_actions()
             self.assertIn("error=0", log.call_args.args[1])
         self.assertFalse(m._tray_ready)
+        m.root.deiconify.assert_not_called()
+        m.show_tray_fallback()
+        m.tray_icon.retry_registration.assert_called_once()
+        m.root.deiconify.assert_not_called()
+        m.show_tray_fallback()
         m.root.deiconify.assert_called_once()
         self.assertIn("保持打开", m.tray_status.set.call_args.args[0])
+        self.assertNotIn("window_visible", m.data)
+        m.tray_icon.registered = True
+        m.tray_actions.put(("tray-result", (m.tray_icon, True, "ADD ok")))
+        m.process_tray_actions()
+        m.root.withdraw.assert_called_once()
 
     def test_stale_success_cannot_hide_after_worker_exits(self):
         m = self.manager(registered=True, alive=False)
-        m._tray_hide_pending = True
         m.tray_actions.put(("tray-result", (m.tray_icon, True, "previous ADD")))
         m.process_tray_actions()
         m.root.withdraw.assert_not_called()
@@ -73,11 +95,120 @@ class TrayRegistrationTests(unittest.TestCase):
 
     def test_pending_receipt_does_not_hide_explicitly_opened_manager(self):
         m = self.manager()
-        m._tray_hide_pending = True
+        m.tray_icon.registered = True
         m.tray_actions.put(("show", None))
         m.tray_actions.put(("tray-result", (m.tray_icon, True, "ADD ok")))
-        m.process_tray_actions()
+        with patch("deskflow_manager.save") as save:
+            m.process_tray_actions()
+            save.assert_called_once_with({"window_visible": True})
         m.root.withdraw.assert_not_called()
+
+    def test_explorer_reconnect_does_not_show_already_hidden_window(self):
+        m = self.manager(registered=True)
+        icon = self.icon()
+        icon._worker = Mock(is_alive=lambda: True)
+        icon._report = lambda current, ready, detail: m.tray_actions.put(("tray-result", (current, ready, detail)))
+        m.tray_icon = icon
+        with patch("deskflow_manager.notify_tray", return_value=(True, 0)):
+            icon._message(tray_win32.NIM_ADD, 0)
+            m.process_tray_actions()
+            icon._message(tray_win32.NIM_DELETE, 0)
+            # Drain between native messages to cover thread interleaving.
+            m.process_tray_actions()
+            icon._message(tray_win32.NIM_ADD, 0)
+            m.process_tray_actions()
+        m.root.deiconify.assert_not_called()
+        self.assertIsNone(m._tray_fallback_job)
+
+    def test_silent_start_restores_visible_state_and_default_remains_hidden(self):
+        m = self.manager()
+        m.fit_to_work_area = Mock()
+        m.ensure_window_placement_hook = Mock()
+        m.restore_window_position = Mock()
+        m.initialize_window()
+        m.root.deiconify.assert_not_called()
+        m.data["window_visible"] = True
+        m.initialize_window()
+        m.root.deiconify.assert_called_once()
+
+    def test_only_hooks_native_wrapper_after_tk_creates_it(self):
+        m = self.manager()
+        m.root.winfo_id.return_value = 10
+        m.watch_window_placement = Mock(return_value=True)
+        with patch("deskflow_manager.win32gui.GetAncestor", side_effect=[10, 20, 20]):
+            m.ensure_window_placement_hook()
+            m.watch_window_placement.assert_not_called()
+            m.ensure_window_placement_hook(SimpleNamespace(widget=m.root))
+            m.ensure_window_placement_hook(SimpleNamespace(widget=m.root))
+        m.watch_window_placement.assert_called_once_with(20)
+
+    def test_position_preserves_negative_coords_and_offscreen_fallback(self):
+        m = self.manager()
+        m.data["window_position"] = [-1200, -70]
+        m.root.winfo_width.return_value = 660
+        m.root.winfo_height.return_value = 500
+        primary = {"Work": (0, 0, 1600, 900), "Flags": 1}
+        secondary = {"Work": (-1600, -100, 0, 800), "Flags": 0}
+        with patch("deskflow_manager.win32api.EnumDisplayMonitors") as enum, \
+             patch("deskflow_manager.win32api.GetMonitorInfo", side_effect={1: primary, 2: secondary}.__getitem__), \
+             patch("deskflow_manager.save") as save:
+            enum.return_value = [(1, None, None), (2, None, None)]
+            m.restore_window_position()
+            m.root.geometry.assert_called_with("+-1200+-70")
+            enum.return_value = [(1, None, None)]
+            m.restore_window_position()
+            m.root.geometry.assert_called_with("+470+200")
+            enum.return_value = [(1, None, None), (2, None, None)]
+            m.restore_window_position()
+            m.root.geometry.assert_called_with("+-1200+-70")
+            save.assert_not_called()
+        self.assertEqual(m.data["window_position"], [-1200, -70])
+
+    def test_invalid_saved_position_does_not_move_window(self):
+        m = self.manager()
+        for position in [None, [], "0,0", [True, 5], [0, 2**31], [10, 20, 30]]:
+            with self.subTest(position=position):
+                m.data["window_position"] = position
+                m.restore_window_position()
+        m.root.geometry.assert_not_called()
+
+    def test_monitor_disappearing_during_enumeration_preserves_position(self):
+        m = self.manager()
+        m.data["window_position"] = [20, 100]
+        with patch("deskflow_manager.win32api.EnumDisplayMonitors", return_value=[(1, None, None)]), \
+             patch("deskflow_manager.win32api.GetMonitorInfo", side_effect=win32api.error):
+            m.restore_window_position()
+        m.root.geometry.assert_not_called()
+        self.assertEqual(m.data["window_position"], [20, 100])
+
+    def test_state_file_failure_does_not_stop_show_or_later_tray_actions(self):
+        m = self.manager(registered=True)
+        m.tray_actions.put(("show", None))
+        m.tray_actions.put(("tray-result", (m.tray_icon, True, "ADD ok")))
+        with patch("deskflow_manager.save", side_effect=PermissionError):
+            m.process_tray_actions()
+        m.root.deiconify.assert_called_once()
+        m.root.withdraw.assert_not_called()
+        self.assertIs(m.data["window_visible"], True)
+        m.root.after.assert_called_once_with(80, m.process_tray_actions)
+
+    def test_completed_user_move_persists_position_but_display_change_only_refits(self):
+        m = self.manager()
+        m._display_recovery_job = None
+        m.fit_to_work_area = Mock()
+        m.restore_window_position = Mock()
+        m.tray_actions.put(("display-change", None))
+        m.tray_actions.put(("display-change", None))
+        with patch("deskflow_manager.save") as save:
+            m.process_tray_actions()
+            m.root.after_cancel.assert_called_once_with("after#tray")
+            m.recover_window_position()
+            m.fit_to_work_area.assert_called_once()
+            m.restore_window_position.assert_called_once()
+            save.assert_not_called()
+            m.tray_actions.put(("window-moved", (-22, 107)))
+            m.process_tray_actions()
+            save.assert_called_once_with({"window_position": [-22, 107]})
 
     def test_living_but_unregistered_icon_does_not_spawn_more_threads(self):
         m = self.manager()

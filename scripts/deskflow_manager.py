@@ -10,7 +10,7 @@ import pystray
 from pystray._util import win32 as tray_win32
 from PIL import Image, ImageDraw, ImageTk
 from win32com.client import Dispatch
-import win32api
+import win32api, win32con, win32gui
 from release_updater import current_version, download_and_verify, is_newer_version, latest_release, spawn_update
 from app_runtime import APP_ROOT, RESOURCE_ROOT, FROZEN, command, watch_update
 from diagnostics import configure_logging, get_logger, logging_arguments, timed_operation, traced
@@ -87,7 +87,10 @@ def load():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     try: return json.loads(STATE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError): return {"installed": False, "pid": None, "autostart": False, "minimize_to_tray": True}
-def save(data): STATE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+def save(data):
+    temporary = STATE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(STATE)
 
 def notify_tray(code, data):
     """Keep the BOOL and thread-local error from this exact Shell call."""
@@ -127,7 +130,10 @@ class RegisteredTrayIcon(pystray.Icon):
             self.registered = result
         elif code == tray_win32.NIM_DELETE or not result:
             self.registered = False
-        self._report(self, self.registered, f"Shell code={code}, ok={result}, error={error}")
+        # Shell can recreate the tray with DELETE followed immediately by ADD.
+        # The removal is intentional; only the outcome of ADD matters then.
+        if code != tray_win32.NIM_DELETE:
+            self._report(self, self.registered, f"Shell code={code}, ok={result}, error={error}")
         return result
 
     def _mark_ready(self):
@@ -205,8 +211,11 @@ class RegisteredTrayIcon(pystray.Icon):
 
 
 class Manager:
+    TRAY_RECOVERY_MS = 750
+
     def __init__(self):
         self.data=load(); self.root=tk.Tk(); self.root.title("DESKFLOW · 智能桌面整理管理器")
+        self.root.withdraw()
         if self.data.get("autostart"): self.write_autostart_entry()
         try: self.root.iconbitmap(default=str(ICON_ICO))
         except tk.TclError: pass
@@ -228,14 +237,18 @@ class Manager:
         self.scrollbar.pack(side="right",fill="y")
         self.status=tk.StringVar(); self.update_status=tk.StringVar(value=f"当前版本 {current_version()}")
         self.update_busy=False; self.tray_icon=None; self.tray_actions=queue.Queue(); self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
-        self._tray_ready=False; self._tray_hide_pending=True
+        self._tray_ready = False
+        self._tray_fallback_job = None
+        self._tray_retried = False
+        self._display_recovery_job = None
+        self._window_placement_hwnd = None
+        self.root.bind("<Map>", self.ensure_window_placement_hook, add="+")
         self.tray_status=tk.StringVar(value="正在连接通知区域…")
         self.draw(); self.refresh()
-        # Stay visible until Shell acknowledges the tray icon.  A background
-        # thread or a Python Icon object alone is not a usable control entry.
         self.ensure_tray()
+        self.schedule_tray_fallback()
         self.root.after(80, self.process_tray_actions)
-        self.root.after_idle(self.fit_to_work_area)
+        self.root.after_idle(self.initialize_window)
         self.update_silent = False
         watch_update(lambda: self.tray_actions.put(("exit", None)))
         if FROZEN:
@@ -275,7 +288,154 @@ class Manager:
         width=min(max(620,requested_width),available_width)
         height=min(requested_height,available_height)
         self.root.geometry(f"{width}x{height}")
+        self.root.update_idletasks()
         self.update_scroll_region()
+
+    def initialize_window(self):
+        self.fit_to_work_area()
+        self.ensure_window_placement_hook()
+        self.restore_window_position()
+        if self.data.get("window_visible") is True:
+            self.root.deiconify()
+            self.root.after_idle(self.remember_initial_window_position)
+
+    def ensure_window_placement_hook(self, event=None):
+        if event is not None and event.widget is not self.root:
+            return
+        child = self.root.winfo_id()
+        hwnd = win32gui.GetAncestor(child, win32con.GA_ROOT)
+        # Tk may create its native top-level wrapper only on the first map.
+        if hwnd and hwnd != child and hwnd != self._window_placement_hwnd:
+            if self.watch_window_placement(hwnd):
+                self._window_placement_hwnd = hwnd
+
+    def watch_window_placement(self, hwnd):
+        """Record user moves, excluding automatic moves during screen changes."""
+        controls = ctypes.WinDLL("comctl32", use_last_error=True)
+        subclass_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.wintypes.HWND,
+                                           ctypes.wintypes.UINT, ctypes.wintypes.WPARAM,
+                                           ctypes.wintypes.LPARAM, ctypes.c_size_t, ctypes.c_size_t)
+        controls.SetWindowSubclass.argtypes = (ctypes.wintypes.HWND, subclass_type, ctypes.c_size_t, ctypes.c_size_t)
+        controls.SetWindowSubclass.restype = ctypes.wintypes.BOOL
+        controls.RemoveWindowSubclass.argtypes = controls.SetWindowSubclass.argtypes[:-1]
+        controls.RemoveWindowSubclass.restype = ctypes.wintypes.BOOL
+        controls.DefSubclassProc.argtypes = subclass_type._argtypes_[:4]
+        controls.DefSubclassProc.restype = ctypes.c_ssize_t
+        move_start = None
+
+        @subclass_type
+        def window_proc(window, message, wparam, lparam, subclass_id, _ref):
+            nonlocal move_start
+            try:
+                if message == win32con.WM_ENTERSIZEMOVE:
+                    move_start = win32gui.GetWindowRect(window)[:2]
+                elif message == win32con.WM_EXITSIZEMOVE:
+                    position = win32gui.GetWindowRect(window)[:2]
+                    if move_start is not None and position != move_start:
+                        self.tray_actions.put(("window-moved", position))
+                    move_start = None
+                elif message == win32con.WM_DISPLAYCHANGE:
+                    self.tray_actions.put(("display-change", None))
+                elif message == win32con.WM_NCDESTROY:
+                    controls.RemoveWindowSubclass(window, window_proc, subclass_id)
+            except Exception:
+                logger.exception("manager.window_placement_message failed")
+            return controls.DefSubclassProc(window, message, wparam, lparam)
+
+        if controls.SetWindowSubclass(hwnd, window_proc, 1, 0):
+            self._window_placement_hook = window_proc
+            return True
+        logger.warning("manager.window_placement_hook unavailable error=%s", ctypes.get_last_error())
+        return False
+
+    def restore_window_position(self):
+        position = self.data.get("window_position")
+        if not (isinstance(position, (list, tuple)) and len(position) == 2 and
+                all(type(value) is int and -(2**31) <= value < 2**31 for value in position)):
+            return
+        x, y = position
+        try:
+            monitors = [win32api.GetMonitorInfo(handle) for handle, _, _ in win32api.EnumDisplayMonitors()]
+        except win32api.error:
+            logger.warning("manager.window_work_areas unavailable", exc_info=True)
+            return
+        if not monitors:
+            return
+        width = self.root.winfo_width()
+        for monitor in monitors:
+            left, top, right, bottom = monitor["Work"]
+            # A reachable portion of the title bar is enough to move the window.
+            overlap = min(x + width, right) - max(x, left)
+            if overlap >= min(120, width) and top - 8 <= y <= bottom - 32:
+                break
+        else:
+            primary = next((monitor for monitor in monitors if monitor["Flags"] & 1), monitors[0])
+            left, top, right, bottom = primary["Work"]
+            x = left + max(0, (right - left - width) // 2)
+            y = top + max(0, (bottom - top - self.root.winfo_height()) // 2)
+        # An explicit '+' lets Tk interpret negative numbers as absolute coords.
+        self.root.geometry(f"+{x}+{y}")
+
+    def recover_window_position(self):
+        self._display_recovery_job = None
+        self.fit_to_work_area()
+        self.restore_window_position()
+
+    def remember_initial_window_position(self):
+        # Keep the first actual placement even if the user never drags it.
+        if self.data.get("window_visible") is not True or self.data.get("window_position") is not None:
+            return
+        hwnd = self._window_placement_hwnd
+        if hwnd and self.root.state() == "normal":
+            try:
+                self.record_window_position(win32gui.GetWindowRect(hwnd)[:2])
+            except win32api.error:
+                logger.warning("manager.window_initial_position unavailable", exc_info=True)
+
+    def record_window_position(self, position):
+        if self.data.get("window_position") != list(position):
+            self.data["window_position"] = list(position)
+            self.save_window_state()
+
+    def set_window_visibility(self, visible):
+        if self.data.get("window_visible") is not visible:
+            self.data["window_visible"] = visible
+            self.save_window_state()
+
+    def save_window_state(self):
+        try:
+            save(self.data)
+        except OSError:
+            logger.warning("manager.window_state_save failed", exc_info=True)
+
+    def reveal_window(self):
+        self.set_window_visibility(True)
+        self.root.deiconify()
+        self.root.lift()
+        self.root.after_idle(self.remember_initial_window_position)
+
+    def schedule_tray_fallback(self):
+        if self.data.get("window_visible") is not True and self._tray_fallback_job is None:
+            self._tray_fallback_job = self.root.after(self.TRAY_RECOVERY_MS, self.show_tray_fallback)
+
+    def show_tray_fallback(self):
+        self._tray_fallback_job = None
+        if self.data.get("window_visible") is True or self._tray_ready:
+            return
+        icon = self.tray_icon
+        if icon and icon.worker_alive():
+            if icon.registered:
+                return  # A successful receipt is already on its way to Tk.
+            if not self._tray_retried:
+                self._tray_retried = True
+                try:
+                    if icon.retry_registration():
+                        self.schedule_tray_fallback()
+                        return
+                except win32api.error:
+                    logger.warning("manager.tray_retry failed", exc_info=True)
+        self.tray_status.set("通知区域暂不可用，窗口保持打开；可点击“重试托盘”")
+        self.root.deiconify()
     def draw(self):
         bg="#101827"; fg="#eef6ff"; accent="#7ee6ff"; body=self.body
         header=tk.Frame(body,bg=bg); header.pack(fill="x",padx=28,pady=(18,2))
@@ -665,22 +825,31 @@ class Manager:
             try: action, target = self.tray_actions.get_nowait()
             except queue.Empty: break
             if action == "show":
-                self._tray_hide_pending = False
-                self.root.deiconify(); self.root.lift(); self.root.focus_force()
+                self.reveal_window()
+                self.root.focus_force()
+            elif action == "window-moved":
+                self.record_window_position(target)
+            elif action == "display-change":
+                if self._display_recovery_job is not None:
+                    self.root.after_cancel(self._display_recovery_job)
+                self._display_recovery_job = self.root.after(250, self.recover_window_position)
             elif action == "tray-result":
                 icon, registered, detail = target
                 if icon is not self.tray_icon:
                     continue
                 self._tray_ready = bool(registered and icon.registered and icon.worker_alive())
                 if self._tray_ready:
+                    self._tray_retried = False
+                    if self._tray_fallback_job is not None:
+                        self.root.after_cancel(self._tray_fallback_job)
+                        self._tray_fallback_job = None
                     self.tray_status.set("通知区域图标已注册；可能位于折叠区")
-                    if self._tray_hide_pending:
-                        self._tray_hide_pending = False
+                    if self.data.get("window_visible") is not True:
                         self.root.withdraw()
                 else:
                     logger.warning("tray.unavailable detail=%s", detail)
-                    self.tray_status.set("通知区域暂不可用，窗口保持打开；可点击“重试托盘”")
-                    self.root.deiconify()
+                    self.tray_status.set("通知区域暂不可用；可点击“重试托盘”")
+                    self.schedule_tray_fallback()
             elif action == "enable":
                 self.enable_app()
             elif action == "arrange-current":
@@ -690,7 +859,8 @@ class Manager:
             elif action == "stop":
                 self.stop_app()
             elif action == "check-update":
-                self.root.deiconify(); self.root.lift(); self.check_for_updates()
+                self.reveal_window()
+                self.check_for_updates()
             elif action == "repair-public-icons":
                 try:
                     from public_desktop_icons import launch_elevated
@@ -764,7 +934,6 @@ class Manager:
             logger.exception("tray.create failed")
             self.tray_icon = None
             self.tray_status.set(f"托盘创建失败，管理器保持可见：{exc}")
-            self.root.deiconify()
         return False
 
     def retry_tray(self):
@@ -778,13 +947,12 @@ class Manager:
 
     def hide_to_tray(self):
         if self.tray.get():
-            self._tray_hide_pending = True
+            self.set_window_visibility(False)
             if self.ensure_tray():
-                self._tray_hide_pending = False
                 self.root.withdraw()
             else:
-                self.root.deiconify()
                 self.tray_status.set("托盘未就绪，窗口保持可见；可点击“重试托盘”")
+                self.schedule_tray_fallback()
         else: self.exit_desktopflow()
     def exit_desktopflow(self):
         self.stop_app()

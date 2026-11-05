@@ -145,6 +145,115 @@ class AttachDiagnosticsTests(unittest.TestCase):
 
 
 class QtFailedDisplayTests(unittest.TestCase):
+    def test_transient_attach_failure_retries_on_unchanged_host(self):
+        from copy import deepcopy
+        from test_qt_incremental import Fixture
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        ui = fixture.ui
+        original = deepcopy(fixture.data)
+        original_save_count = fixture.saved
+        ui.shell.restore_icons = Mock()
+        ui.shell.hide_icons = Mock()
+        ui.shell.attach = Mock(return_value=False)
+        ui.panels["a"]._appearance = None
+        with patch("qt_desktop.perf_counter", return_value=100.0) as clock:
+            ui.render("a")
+            self.assertEqual(ui.panels, {})
+            ui.shell.restore_icons.assert_called_once()
+            ui.shell.hide_icons.assert_not_called()
+            ui.shell.attach.reset_mock()
+            clock.return_value = 104.0
+            ui.tick()
+            ui.shell.attach.assert_not_called()
+            clock.return_value = 106.0
+            ui.tick()
+            self.assertEqual(ui.shell.attach.call_count, 2)
+            self.assertEqual(ui.panels, {})
+            ui.shell.hide_icons.assert_not_called()
+            ui.shell.attach.reset_mock()
+            ui.shell.attach.return_value = True
+            clock.return_value = 110.0
+            ui.tick()
+            ui.shell.attach.assert_not_called()
+            clock.return_value = 112.0
+            ui.tick()
+            self.assertEqual(set(ui.panels), {"a", "b"})
+            ui.shell.hide_icons.assert_called_once()
+            self.assertEqual(fixture.data, original)
+            self.assertEqual(fixture.saved, original_save_count)
+            ui.shell.attach.reset_mock()
+            clock.return_value = 130.0
+            ui.tick()
+            ui.shell.attach.assert_not_called()
+
+    def test_pending_attach_retry_does_not_run_before_explicit_close(self):
+        from test_qt_incremental import Fixture
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        ui = fixture.ui
+        ui.shell.attach = Mock(return_value=False)
+        ui.panels["a"]._appearance = None
+        with patch("qt_desktop.perf_counter", return_value=100.0) as clock:
+            ui.render("a")
+            ui.shell.attach.reset_mock()
+            ui.events.put({"type": "close"})
+            clock.return_value = 106.0
+            with patch.object(ui, "close") as close:
+                ui.tick()
+            close.assert_called_once()
+            ui.shell.attach.assert_not_called()
+
+    def test_attach_retry_waits_when_shell_host_disappears(self):
+        from test_qt_incremental import Fixture
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        ui = fixture.ui
+        ui.shell.attach = Mock(return_value=False)
+        ui.panels["a"]._appearance = None
+        ui.shell._find_overlay_host = Mock(return_value=1)
+
+        def refresh_host():
+            previous = ui.shell.host
+            ui.shell.host = ui.shell._find_overlay_host()
+            return ui.shell.host != previous
+
+        ui.shell.keep_panels_above_desktop_backdrop = refresh_host
+        with patch("qt_desktop.perf_counter", return_value=100.0) as clock:
+            ui.render("a")
+            ui.shell.attach.reset_mock()
+            ui.shell.attach.return_value = True
+            # The first lookup sees a live host. It disappears before render.
+            ui.shell._find_overlay_host.side_effect = [1, 0]
+            clock.return_value = 106.0
+            ui.tick()
+            ui.shell._find_overlay_host.side_effect = None
+            ui.shell._find_overlay_host.return_value = 0
+            clock.return_value = 107.0
+            ui.tick()
+            ui.shell.attach.assert_not_called()
+            self.assertEqual(ui.panels, {})
+            ui.shell._find_overlay_host.return_value = 1
+            clock.return_value = 108.0
+            ui.tick()
+            ui.shell.attach.assert_not_called()
+            clock.return_value = 112.0
+            ui.tick()
+            self.assertEqual(set(ui.panels), {"a", "b"})
+
+    def test_no_categories_does_not_schedule_reattach(self):
+        from test_qt_incremental import Fixture
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        ui = fixture.ui
+        fixture.categories = []
+        ui.render()
+        self.assertEqual(ui.panels, {})
+        scan_count = fixture.scanned
+        with patch("qt_desktop.perf_counter", return_value=1000.0):
+            ui.tick()
+        self.assertEqual(fixture.scanned, scan_count)
+
     def test_signature_change_after_failed_attach_never_hides_without_panels(self):
         # Offscreen Qt + fake Shell fixture; every attribute API is a Mock.
         from test_qt_incremental import Fixture

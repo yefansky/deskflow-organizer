@@ -65,6 +65,7 @@ PANEL_MODE_LABELS = {
     "cards": "纯图标网格",
 }
 PANEL_MODE_GLYPHS = {"list": "☷", "compact": "≡", "cards": "▦"}
+PANEL_ATTACH_RETRY_SECONDS = 5.0
 
 
 def _with_shadow(widget: QWidget, strength: int = 220) -> None:
@@ -711,6 +712,7 @@ class QtOrganizerUI:
         self.app = QApplication.instance() or QApplication([])
         self.app.setQuitOnLastWindowClosed(False)
         self.panels: dict[str, PanelWindow] = {}
+        self._panel_attach_retry_at: float | None = None
         self.selected_panels: set[str] = set()
         self._marquee_start: tuple[int, int, int] | None = None
         self._marquee_dragged = False
@@ -1070,8 +1072,12 @@ class QtOrganizerUI:
         # Rebuilding a panel invalidates all of its ItemWidget wrappers.  Never
         # retain a selection reference across that boundary: a later right
         # click would otherwise call update() on an already deleted C++ object.
+        if self._panel_attach_retry_at is not None:
+            only = None  # A failed attach removed every panel.
         self.shell.host = self.shell._find_overlay_host()
         if not self.shell.host:
+            if self._panel_attach_retry_at is not None:
+                self._panel_attach_retry_at = perf_counter() + PANEL_ATTACH_RETRY_SECONDS
             self._destroy_all()
             self.shell.restore_icons()
             return
@@ -1151,9 +1157,11 @@ class QtOrganizerUI:
         if not all(attached) or not all(
             self.shell.panel_is_desktop_child(int(panel.winId())) for panel in self.panels.values()
         ):
+            self._panel_attach_retry_at = perf_counter() + PANEL_ATTACH_RETRY_SECONDS
             self._destroy_all()
             self.shell.restore_icons()
             return
+        self._panel_attach_retry_at = None
         self.apply_favorite_visibility()
         self.shell.keep_panels_above_desktop_backdrop()
         if structural_change or display_changed:
@@ -1201,8 +1209,9 @@ class QtOrganizerUI:
                 self.panels[category]._appearance = None
                 self.render(category)
             if not self.panels:
-                logger.info("desktop.recovery rebuild_missing_panels")
-                self.render()
+                if self._panel_attach_retry_at is None:
+                    logger.info("desktop.recovery rebuild_missing_panels")
+                    self.render()
             elif all(self.shell.panel_is_desktop_child(int(panel.winId())) and
                      (not self.panel_wanted(category) or self.shell.panel_is_visible(int(panel.winId())))
                      for category, panel in self.panels.items()):
@@ -1285,6 +1294,8 @@ class QtOrganizerUI:
                 self.arrange_top_right(rebuild=rerender or recovery)
         elif rerender:
             self.render()
+        elif self._panel_attach_retry_at is not None and perf_counter() >= self._panel_attach_retry_at:
+            self.render(groups=self._groups if scanned else None)
         else:
             if changed and not scanned:
                 self._groups = self.model.scan()
