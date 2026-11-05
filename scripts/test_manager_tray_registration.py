@@ -210,6 +210,20 @@ class TrayRegistrationTests(unittest.TestCase):
             m.process_tray_actions()
             save.assert_called_once_with({"window_position": [-22, 107]})
 
+    def test_first_user_visible_placement_is_saved_even_without_dragging(self):
+        m = self.manager()
+        m._window_placement_hwnd = 20
+        m.root.state.return_value = "normal"
+        with patch("deskflow_manager.win32gui.GetWindowRect", return_value=(52, 54, 706, 837)) as rect, \
+             patch("deskflow_manager.save") as save:
+            m.remember_initial_window_position()
+            rect.assert_not_called()  # Temporary tray failure must not pick a preference.
+            m.data["window_visible"] = True
+            m.remember_initial_window_position()
+            m.remember_initial_window_position()
+            rect.assert_called_once_with(20)
+            save.assert_called_once_with({"window_visible": True, "window_position": [52, 54]})
+
     def test_living_but_unregistered_icon_does_not_spawn_more_threads(self):
         m = self.manager()
         with patch("deskflow_manager.RegisteredTrayIcon") as create:
