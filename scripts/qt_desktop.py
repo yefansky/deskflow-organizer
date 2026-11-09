@@ -186,11 +186,13 @@ class HeaderButton(QToolButton):
 
 
 class TipBubble(QFrame):
-    """In-panel summary bubble that survives Explorer desktop reparenting."""
+    """Non-activating, input-transparent summary beside its desktop panel."""
 
     def __init__(self, panel: "PanelWindow") -> None:
-        super().__init__(panel)
+        super().__init__(panel, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowDoesNotAcceptFocus | Qt.WindowType.WindowTransparentForInput)
         self.panel = panel
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(
@@ -211,31 +213,24 @@ class TipBubble(QFrame):
         if not text.strip() or not anchor.isVisible():
             self.hide()
             return
-        anchor_pos = anchor.mapTo(self.panel, QPoint(0, 0))
-        icon = getattr(anchor, "icon_label", None)
-        inset = (icon.mapTo(self.panel, QPoint(0, 0)).x() + icon.width() + 16
-                 if icon is not None else anchor_pos.x() + 24)
-        x = max(8, min(inset, self.panel.width() - 128))
-        width = max(120, min(360, self.panel.width() - x - 8))
-        self.label.setFixedWidth(max(102, width - 18))
+        panel_rect = QRect(self.panel.mapToGlobal(QPoint(0, 0)), self.panel.size())
+        anchor_pos = anchor.mapToGlobal(QPoint(0, 0))
+        screen = QApplication.screenAt(panel_rect.center()) or self.panel.screen()
+        bounds = screen.availableGeometry()
+        right_space = bounds.right() - panel_rect.right() - 8
+        left_space = panel_rect.left() - bounds.left() - 8
+        place_right = right_space >= 120 or right_space >= left_space
+        space = right_space if place_right else left_space
+        if space < 40:
+            self.hide()
+            return
+        width = min(360, space)
+        self.label.setFixedWidth(max(1, width - 18))
         self.label.setText(text)
         self.label.adjustSize()
         self.adjustSize()
-        x = max(8, min(x, self.panel.width() - self.width() - 8))
-        # Prefer the area above the hovered row, so the next icon stays visible.
-        above = anchor_pos.y() - self.height() - 12
-        below = anchor_pos.y() + anchor.height() + 12
-        occupied = [QRect(item.mapTo(self.panel, QPoint(0, 0)), item.size())
-                    for item in self.panel.item_widgets if item.isVisible()]
-        content_bottom = max((rect.bottom() for rect in occupied), default=35)
-        candidates = (content_bottom + 12, self.panel.height() - self.height() - 8, above, below)
-        y = next((candidate for candidate in candidates
-                  if candidate >= 8 and candidate + self.height() <= self.panel.height() - 8
-                  and not any(QRect(x, candidate, self.width(), self.height()).intersects(rect)
-                              for rect in occupied)), None)
-        if y is None:
-            y = above if above >= 8 else below
-            y = max(8, min(y, self.panel.height() - self.height() - 8))
+        x = panel_rect.right() + 9 if place_right else panel_rect.left() - self.width() - 8
+        y = max(bounds.top(), min(anchor_pos.y(), bounds.bottom() - self.height() + 1))
         self.move(x, y)
         self.raise_()
         self.show()
@@ -304,10 +299,8 @@ class ItemWidget(QWidget):
         if self.mode == "cards":
             display_name = Path(item["name"]).stem if item["kind"] != "folder" else item["name"]
             tip = display_name if tip == item["name"] else f"{display_name}\n{tip}"
-        # Qt's native tooltip is a separate top-level window.  DESKFLOW panels
-        # are non-activating Explorer desktop children, so Windows can place
-        # that tooltip behind the desktop composition surface.  Keep the Tip
-        # in the panel's own paint tree instead.
+        # Use our owned Tool bubble beside the panel, rather than Qt's native
+        # ToolTip window, which can disappear behind desktop composition.
         self.tip_text = tip
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
@@ -513,6 +506,10 @@ class PanelWindow(QWidget):
         outer.addWidget(self.scroll, 1)
         self.tip_bubble = TipBubble(self)
         self._tip_generation = 0
+
+    def hideEvent(self, event) -> None:  # type: ignore[override]
+        self.hide_item_tip()
+        super().hideEvent(event)
 
     def _reflow_items(self) -> None:
         """Repack existing item widgets without rebuilding the panel window."""

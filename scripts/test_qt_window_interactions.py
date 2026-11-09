@@ -7,9 +7,10 @@ import unittest
 import threading
 from unittest.mock import Mock, patch
 
-from PySide6.QtCore import QPoint, QRect
-from PySide6.QtGui import QIcon, QPixmap, QColor, QFontDatabase
+from PySide6.QtCore import QPoint, QRect, Qt
+from PySide6.QtGui import QIcon, QPixmap, QColor, QFontDatabase, QPainter
 from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtTest import QTest
 from qt_desktop import QtOrganizerUI, PanelWindow, HeaderButton
 
 
@@ -156,7 +157,8 @@ class QtInteractionTests(unittest.TestCase):
             icon_grid_cell_height=lambda: 72, icon_grid_icon_size=lambda: 40,
             icon_for=lambda *args: QIcon(pixmap), item_tip=lambda item: "合成示例摘要，说明用途。",
             show_panel_menu=noop, show_sort_menu=noop, cycle_mode=noop,
-            arrange_top_right=noop, settings=noop, close=noop)
+            arrange_top_right=noop, settings=noop, close=noop,
+            select_item=Mock(), open_item=Mock())
         category = SimpleNamespace(id="sample", title="合成分类", color="#55bbaa")
         items = [{"name": f"合成条目 {index}", "path": f"G:/synthetic/{index}.txt",
                   "kind": "file", "modified": "2026-10-24"} for index in range(12)]
@@ -175,12 +177,37 @@ class QtInteractionTests(unittest.TestCase):
                     anchor = panel.item_widgets[index]
                     panel.tip_bubble.show_for(anchor, "合成示例摘要，说明用途。")
                     self.app.processEvents()
-                    self.assertGreaterEqual(panel.tip_bubble.x(), 8)
-                    self.assertLessEqual(panel.tip_bubble.geometry().right(), panel.width() - 8)
-                    self.assertGreaterEqual(panel.tip_bubble.y(), 8)
+                    bubble = panel.tip_bubble
+                    panel_rect = QRect(panel.mapToGlobal(QPoint(0, 0)), panel.size())
+                    self.assertGreater(bubble.x(), panel_rect.right())
+                    self.assertFalse(bubble.geometry().intersects(panel_rect))
+                    self.assertTrue(bubble.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents))
+                    self.assertTrue(bubble.windowFlags() & Qt.WindowType.WindowTransparentForInput)
                     panel.grab().save(str(output / f"synthetic-tip-{mode}-{width}-{position}.png"))
             panel.tip_bubble.show_for(buttons[0], buttons[0].help_text)
             panel.grab().save(str(output / f"synthetic-header-help-{mode}.png"))
+            anchor = panel.item_widgets[0]
+            panel.tip_bubble.show_for(anchor, "提示在整理块右侧，图标和标题完整可见。")
+            self.app.processEvents()
+            preview = QPixmap(panel.width() + panel.tip_bubble.width() + 24, panel.height())
+            preview.fill(QColor("#64758b"))
+            painter = QPainter(preview)
+            painter.drawPixmap(0, 0, panel.grab())
+            painter.drawPixmap(panel.width() + 8, panel.tip_bubble.y() - panel.y(), panel.tip_bubble.grab())
+            painter.end()
+            preview.save(str(output / f"synthetic-external-tip-{mode}.png"))
+            QTest.mouseClick(anchor, Qt.MouseButton.LeftButton)
+            controller.select_item.assert_called_with(anchor)
+            panel.tip_bubble.show_for(anchor, "双击时提示仍不挡图标")
+            QTest.mouseDClick(anchor, Qt.MouseButton.LeftButton)
+            controller.open_item.assert_called_with(anchor.item["path"])
+            bounds = panel.screen().availableGeometry()
+            panel.move(bounds.right() - panel.width() + 1, bounds.top() + 20)
+            self.app.processEvents()
+            panel.tip_bubble.show_for(panel.item_widgets[0], "屏边回退")
+            self.assertLess(panel.tip_bubble.geometry().right(), panel.x())
+            panel.hide()
+            self.assertFalse(panel.tip_bubble.isVisible())
             panel.close()
         dialog = QMessageBox(QMessageBox.Icon.Question, "确认移除空整理块",
             "移除这个空整理块；有新内容时会重新显示。",
